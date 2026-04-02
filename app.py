@@ -10,25 +10,33 @@ import AMD_Tools4 as amd
 app = Flask(__name__)
 
 # ====================================================================
-# ★ 爆速化＆堅牢化の要
+# ★ 爆速化＆堅牢化の要（日付変換のエラーを完全に修正！）
 # ====================================================================
 def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
+        
+        # 日付変換のバグを修正：どんな形式できても確実に変換する
+        dates = pd.to_datetime(tim)
+        dates = dates.normalize() if isinstance(dates, pd.DatetimeIndex) else dates.dt.normalize()
+        
         return pd.DataFrame({
-            "date": pd.to_datetime(tim).dt.normalize(),
+            "date": dates,
             element: val[:, 0, 0]
         })
-    except Exception:
+    except Exception as e:
+        print(f"API Error ({element}): {e}")
         return pd.DataFrame(columns=["date", element])
 
 @lru_cache(maxsize=128)
 def get_cached_avg_data(year, lat, lon):
     start_str = f"{year}-04-01"
     end_str = f"{year+1}-03-31"
+    
     df_t = fetch_met_data("TMP_mea", start_str, end_str, lat, lon)
     if df_t.empty:
         return None
+        
     df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
     return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
 
@@ -39,6 +47,7 @@ def get_cached_past_year(py_start, py_end, lat, lon):
     
     if df_t.empty and df_p.empty:
         return None
+        
     if not df_t.empty and not df_p.empty:
         df = df_t.merge(df_p, on="date", how="outer")
     else:
@@ -79,7 +88,7 @@ def get_climate_data():
         start_year_for_avg = current_year - 3
         target_year = ct1_start_ts.year if ct1_start_ts.month >= 4 else ct1_start_ts.year - 1
 
-        # 1. 平年値の計算（気温のみ）
+        # 1. 平年値の計算
         all_years_data = []
         for year in range(start_year_for_avg, start_year_for_avg + 3):
             res = get_cached_avg_data(year, lat, lon)
@@ -212,8 +221,7 @@ def get_climate_data():
             df_ct["cum_pr"] = df_ct["daily_pr"].cumsum().round(1)
             
             # ================================================================
-            # ★ ここが究極の消去ロジック！
-            # 26日先より未来の雨量・積算雨量は、問答無用で「空欄(NaN)」にする！
+            # ★ 未来の雨量はここで確実に空欄にする
             # ================================================================
             mask_future = df_ct["date"] > forecast_end
             df_ct.loc[mask_future, "daily_pr"] = np.nan
@@ -247,49 +255,4 @@ def get_climate_data():
             else:
                 hist_dict = {}
                 
-            return df_ct, closest_dict, corrected_dict, hist_dict
-
-        df_ct1, closest_dict1, corrected_dict1, hist_dict1 = calc_accumulation(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
-        
-        df_ct2 = pd.DataFrame()
-        closest_dict2 = {}
-        hist_dict2 = {}
-        if is_double:
-            df_ct2, closest_dict2, _, hist_dict2 = calc_accumulation(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
-
-        # 6. JSONデータのクリーンアップ（NaNを確実に空文字へ変換）
-        def replace_nan(d):
-            if isinstance(d, list): return [replace_nan(x) for x in d]
-            if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
-            # pd.isnaを使って、NaNがあれば確実に「""（空の文字列）」に変換してスプレッドシートを空白にする
-            if pd.isna(d): return "" 
-            return d
-
-        df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
-        df_forecast["date"] = df_forecast["date"].dt.strftime("%Y-%m-%d")
-        if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].dt.strftime("%Y-%m-%d")
-        if not df_ct2.empty: df_ct2["date"] = df_ct2["date"].dt.strftime("%Y-%m-%d")
-
-        res_dict = {
-            "average": replace_nan(df_avg.to_dict(orient="records")),
-            "this_year": replace_nan(df_this.to_dict(orient="records")),
-            "forecast": replace_nan(df_forecast.to_dict(orient="records")),
-            "ct1": replace_nan(df_ct1.to_dict(orient="records")),
-            "gdd1_target": closest_dict1,
-            "gdd1_target_corr": corrected_dict1,
-            "ct1_until_yesterday": hist_dict1,
-        }
-        
-        if is_double:
-            res_dict["ct2"] = replace_nan(df_ct2.to_dict(orient="records"))
-            res_dict["gdd2_target"] = closest_dict2
-            res_dict["ct2_until_yesterday"] = hist_dict2
-
-        return jsonify(res_dict)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 400
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+            return df_ct, closest_
