@@ -89,30 +89,56 @@ def get_climate_data():
                 df_this.drop(columns=["month_day"], inplace=True)
 
         # ====================================================================
-        # ★ 予報部分の確実な取得方法：
-        # APIのエラーを防ぐため「30日前〜26日後」の安全な範囲で取得し、
-        # その中から「昨日〜7日後」の9日間だけを切り出す。
+        # ★ 予報部分の究極の解決策：年度またぎエラーを回避！
+        # 今年度と昨年度を別々に取得して結合し、そこから9日間を切り出す。
         # ====================================================================
-        r_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-        r_end   = (today + timedelta(days=26)).strftime("%Y-%m-%d")
-        try:
-            r_temp, r_tim, *_ = amd.GetMetData("TMP_mea", [r_start, r_end], [lat, lat, lon, lon])
-            r_prcp, *_ = amd.GetMetData("APCPRA", [r_start, r_end], [lat, lat, lon, lon])
-            
-            df_real = pd.DataFrame({
-                "date": pd.to_datetime(r_tim).map(lambda d: d.date()),
-                "tave_this": r_temp[:, 0, 0],
-                "prcp_this": r_prcp[:, 0, 0]
-            })
-            
-            # 昨日から7日後までの9日間を抽出
+        df_real_list = []
+        
+        # 1) 今年度データの追加（すでに取得済みなら再利用して高速化）
+        if target_year == current_year and not df_this.empty:
+            df_real_list.append(df_this)
+        else:
+            try:
+                cy_start = f"{current_year}-04-01"
+                cy_end   = f"{current_year+1}-03-31"
+                t1, tim1, *_ = amd.GetMetData("TMP_mea", [cy_start, cy_end], [lat, lat, lon, lon])
+                p1, *_       = amd.GetMetData("APCPRA", [cy_start, cy_end], [lat, lat, lon, lon])
+                df_cy = pd.DataFrame({
+                    "date": pd.to_datetime(tim1).map(lambda d: d.date()),
+                    "tave_this": t1[:, 0, 0],
+                    "prcp_this": p1[:, 0, 0]
+                })
+                df_real_list.append(df_cy)
+            except Exception:
+                pass
+
+        # 2) 昨年度データの追加（今日が4月上旬の場合、「昨日」が3月に含まれるため必須！）
+        if today.month == 4 and today.day <= 7:
+            if target_year == current_year - 1 and not df_this.empty:
+                df_real_list.append(df_this)
+            else:
+                try:
+                    py_start = f"{current_year-1}-04-01"
+                    py_end   = f"{current_year}-03-31"
+                    t2, tim2, *_ = amd.GetMetData("TMP_mea", [py_start, py_end], [lat, lat, lon, lon])
+                    p2, *_       = amd.GetMetData("APCPRA", [py_start, py_end], [lat, lat, lon, lon])
+                    df_py = pd.DataFrame({
+                        "date": pd.to_datetime(tim2).map(lambda d: d.date()),
+                        "tave_this": t2[:, 0, 0],
+                        "prcp_this": p2[:, 0, 0]
+                    })
+                    df_real_list.append(df_py)
+                except Exception:
+                    pass
+
+        # 3) ガチャンと結合して9日間を切り出し
+        if df_real_list:
+            df_real = pd.concat(df_real_list).reset_index(drop=True)
             f_start_date = today - timedelta(days=1)
             f_end_date   = today + timedelta(days=7)
             mask_f = (df_real["date"] >= f_start_date) & (df_real["date"] <= f_end_date)
             df_forecast = df_real.loc[mask_f].reset_index(drop=True)
-            
-        except Exception as e:
-            print("Forecast Error:", e) # レンダーのログに原因を残す
+        else:
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
         # ====================================================================
 
