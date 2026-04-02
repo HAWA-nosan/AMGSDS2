@@ -22,61 +22,90 @@ def get_climate_data():
     lat, lon = map(float, (d["lat"], d["lon"]))
 
     today = datetime.utcnow().date()
-    this_year = today.year if today.month >= 4 else today.year - 1
-    start_year = this_year - 3
+    
+    # ==================================================================
+    # 1. 基準年の設定（平年値と実測値の分離）
+    # ==================================================================
+    current_year = today.year if today.month >= 4 else today.year - 1
+    start_year_for_avg = current_year - 3
 
-    # --- 平年値の計算（過去3年） ---
+    # GASから「開始日(ct1_start)」が送られてきている場合はその年をターゲットに。
+    # 送られていないシンプルなリクエストの場合は「今年」をターゲットにする。
+    if "ct1_start" in d and d["ct1_start"]:
+        try:
+            ct1_start = datetime.fromisoformat(d["ct1_start"]).date()
+            target_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
+        except Exception:
+            target_year = current_year
+    else:
+        target_year = current_year
+
+    # --- 平年値の計算（常に現在から過去3年） ---
     all_years_data = []
-    for year in range(start_year, start_year + 3):
+    for year in range(start_year_for_avg, start_year_for_avg + 3):
         start = f"{year}-04-01"
         end = f"{year+1}-03-31"
-        temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
-        flat_temp = temp[:, 0, 0]
+        try:
+            # 万が一データ取得に失敗してもサーバーが落ちないようにtry-exceptで保護
+            temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
+            flat_temp = temp[:, 0, 0]
 
-        df = pd.DataFrame({
-            "datetime": pd.to_datetime(tim),
-            "tave": flat_temp
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(tim),
+                "tave": flat_temp
+            })
+            df["month_day"] = df["datetime"].dt.strftime("%m-%d")
+            all_years_data.append(df[["month_day", "tave"]])
+        except Exception:
+            pass
+
+    if all_years_data:
+        df_concat = pd.concat(all_years_data)
+        df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
+        df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
+
+        # 並び替え（4月始まり）
+        def reorder_from_april(df):
+            df = df.copy()
+            df["sort_key"] = pd.to_datetime("2000-" + df["month_day"])
+            df = df.sort_values("sort_key").reset_index(drop=True)
+            start_idx = df[df["month_day"] == "04-01"].index[0]
+            return pd.concat([df.iloc[start_idx:], df.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
+
+        df_avg = reorder_from_april(df_avg)
+        df_avg["tave_avg"] = df_avg["tave_avg"].round(1)
+        df_avg_raw = df_avg.to_dict(orient="records")
+    else:
+        df_avg_raw = []
+
+    # --- 対象年度の実測値（＋タグ） ---
+    start_this = f"{target_year}-04-01"
+    end_this = f"{target_year + 1}-03-31"
+    
+    try:
+        temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [start_this, end_this], [lat, lat, lon, lon])
+        df_this = pd.DataFrame({
+            "date": pd.to_datetime(tim_this).map(lambda d: d.date()),
+            "tave_this": temp_this[:, 0, 0]
         })
-        df["month_day"] = df["datetime"].dt.strftime("%m-%d")
-        all_years_data.append(df[["month_day", "tave"]])
 
-    df_concat = pd.concat(all_years_data)
-    df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
-    df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
+        yesterday = today - timedelta(days=1)
+        forecast_end = today + timedelta(days=26)
 
-    # 並び替え（4月始まり）
-    def reorder_from_april(df):
-        df = df.copy()
-        df["sort_key"] = pd.to_datetime("2000-" + df["month_day"])
-        df = df.sort_values("sort_key").reset_index(drop=True)
-        start_idx = df[df["month_day"] == "04-01"].index[0]
-        return pd.concat([df.iloc[start_idx:], df.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
+        def assign_tag(d):
+            if d <= yesterday:
+                return "past"
+            elif d <= forecast_end:
+                return "forecast"
+            else:
+                return "normal"
 
-    df_avg = reorder_from_april(df_avg)
-    df_avg["tave_avg"] = df_avg["tave_avg"].round(1)
-
-    # --- 今年度の実測値（＋タグ） ---
-    start_this = f"{this_year}-04-01"
-    end_this = f"{this_year + 1}-03-31"
-    temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [start_this, end_this], [lat, lat, lon, lon])
-    df_this = pd.DataFrame({
-        "date": pd.to_datetime(tim_this).map(lambda d: d.date()),
-        "tave_this": temp_this[:, 0, 0]
-    })
-
-    yesterday = today - timedelta(days=1)
-    forecast_end = today + timedelta(days=26)
-
-    def assign_tag(d):
-        if d <= yesterday:
-            return "past"
-        elif d <= forecast_end:
-            return "forecast"
-        else:
-            return "normal"
-
-    df_this["tag"] = df_this["date"].map(assign_tag)
-    df_this["date"] = df_this["date"].astype(str)
+        df_this["tag"] = df_this["date"].map(assign_tag)
+        df_this["date"] = df_this["date"].astype(str)
+        df_this_raw = df_this.to_dict(orient="records")
+    except Exception:
+        # データが空の場合の安全対策
+        df_this_raw = []
 
     # NaN → None 対応
     def replace_nan_with_none(data):
@@ -89,8 +118,8 @@ def get_climate_data():
         else:
             return data
 
-    df_avg_clean = replace_nan_with_none(df_avg.to_dict(orient="records"))
-    df_this_clean = replace_nan_with_none(df_this.to_dict(orient="records"))
+    df_avg_clean = replace_nan_with_none(df_avg_raw)
+    df_this_clean = replace_nan_with_none(df_this_raw)
 
     return jsonify({
         "average": df_avg_clean,
