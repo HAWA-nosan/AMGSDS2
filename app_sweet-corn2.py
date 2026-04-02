@@ -97,15 +97,6 @@ def parse_request_payload(d: dict) -> dict:
 
 
 # =========================================================
-# 年度計算
-# =========================================================
-def get_fiscal_year_today():
-    today = datetime.utcnow().date()
-    fiscal_year = today.year if today.month >= 4 else today.year - 1
-    return today, fiscal_year
-
-
-# =========================================================
 # 気象データ取得
 # =========================================================
 def fetch_point_series(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
@@ -118,6 +109,7 @@ def fetch_point_series(var_name: str, start_date: str, end_date: str, lat: float
 def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years: int = 3) -> pd.DataFrame:
     """
     過去 n_years の 4/1〜翌3/31 の TMP_mea から month_day 平年値を作る
+    ★アップデート：エラー回避機能を追加
     """
     all_years = []
     start_year = fiscal_year - n_years
@@ -125,14 +117,19 @@ def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years:
     for year in range(start_year, fiscal_year):
         start = f"{year}-04-01"
         end = f"{year + 1}-03-31"
-        dates, values = fetch_point_series("TMP_mea", start, end, lat, lon)
+        try:
+            dates, values = fetch_point_series("TMP_mea", start, end, lat, lon)
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(dates),
+                "tave": values
+            })
+            df["month_day"] = df["datetime"].dt.strftime("%m-%d")
+            all_years.append(df[["month_day", "tave"]])
+        except Exception:
+            pass # 1年分のデータが欠損していても処理を止めない
 
-        df = pd.DataFrame({
-            "datetime": pd.to_datetime(dates),
-            "tave": values
-        })
-        df["month_day"] = df["datetime"].dt.strftime("%m-%d")
-        all_years.append(df[["month_day", "tave"]])
+    if not all_years:
+        return pd.DataFrame(columns=["month_day", "tave_avg"])
 
     df_concat = pd.concat(all_years, ignore_index=True)
     df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
@@ -152,24 +149,31 @@ def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years:
 def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: date, df_avg: pd.DataFrame) -> pd.DataFrame:
     """
     今年度の実測値＋予報/平年補完用データを作る
-    必要変数:
-      TMP_mea, TMP_max, TMP_min, APCPRA
+    ★アップデート：エラー回避機能を追加
     """
     start_this = f"{fiscal_year}-04-01"
     end_this = f"{fiscal_year + 1}-03-31"
 
-    dates, tmean = fetch_point_series("TMP_mea", start_this, end_this, lat, lon)
-    _, tmax = fetch_point_series("TMP_max", start_this, end_this, lat, lon)
-    _, tmin = fetch_point_series("TMP_min", start_this, end_this, lat, lon)
-    _, prcp = fetch_point_series("APCPRA", start_this, end_this, lat, lon)
+    try:
+        dates, tmean = fetch_point_series("TMP_mea", start_this, end_this, lat, lon)
+        _, tmax = fetch_point_series("TMP_max", start_this, end_this, lat, lon)
+        _, tmin = fetch_point_series("TMP_min", start_this, end_this, lat, lon)
+        _, prcp = fetch_point_series("APCPRA", start_this, end_this, lat, lon)
 
-    df = pd.DataFrame({
-        "date": dates,
-        "tave_this": tmean,
-        "tmax_this": tmax,
-        "tmin_this": tmin,
-        "prcp_this": prcp
-    })
+        df = pd.DataFrame({
+            "date": dates,
+            "tave_this": tmean,
+            "tmax_this": tmax,
+            "tmin_this": tmin,
+            "prcp_this": prcp
+        })
+    except Exception:
+        # 気象データが全く取得できなかった場合の安全用空データフレーム
+        df = pd.DataFrame(columns=["date", "tave_this", "tmax_this", "tmin_this", "prcp_this"])
+
+    if df.empty:
+        df["tag"] = []
+        return df
 
     yesterday = today - timedelta(days=1)
     forecast_end = today + timedelta(days=26)
@@ -184,15 +188,16 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
 
     df["tag"] = df["date"].map(assign_tag)
 
-    # 平年値 merge
-    df["month_day"] = df["date"].map(lambda d: d.strftime("%m-%d"))
-    df = df.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
+    if not df_avg.empty:
+        # 平年値 merge
+        df["month_day"] = df["date"].map(lambda d: d.strftime("%m-%d"))
+        df = df.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
 
-    # normal 部分だけ 平年値で tave を置換
-    normal_mask = df["tag"] == "normal"
-    df.loc[normal_mask, "tave_this"] = df.loc[normal_mask, "tave_avg"]
-
-    df.drop(columns=["month_day", "tave_avg"], inplace=True)
+        # normal 部分だけ 平年値で tave を置換
+        normal_mask = df["tag"] == "normal"
+        df.loc[normal_mask, "tave_this"] = df.loc[normal_mask, "tave_avg"]
+        df.drop(columns=["month_day", "tave_avg"], inplace=True)
+    
     return df
 
 
@@ -202,10 +207,6 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
 def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
     """
     sweetcorn_data-DL.csv を読み込む
-    想定列:
-      date, DL
-    例:
-      4/1, 0.5305555556
     """
     if not csv_path.exists():
         raise FileNotFoundError(f"Daylength CSV not found: {csv_path}")
@@ -231,9 +232,6 @@ def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
 
 
 def add_daylength_from_csv(df: pd.DataFrame, df_dl_master: pd.DataFrame) -> pd.DataFrame:
-    """
-    date 列から month_day を作り、CSVの日長を結合して DL_hours を追加
-    """
     if df.empty:
         out = df.copy()
         out["DL_hours"] = pd.Series(dtype=float)
@@ -267,9 +265,6 @@ def validate_method_and_thresholds(method: int, t_base: float, t_ceiling):
 
 
 def calc_daily_gdd_core(tmean, tmax, method, t_base, t_ceiling=None):
-    """
-    method 1~4 のコア部分（日長なし）
-    """
     if method == 1:
         return max(0.0, tmean - t_base)
 
@@ -298,10 +293,6 @@ def calc_daily_gdd_core(tmean, tmax, method, t_base, t_ceiling=None):
 
 
 def calc_daily_gdd(row, method, t_base, t_ceiling=None):
-    """
-    method 1~8 を1日単位で計算
-    5~8 は 1~4 に日長 DL を乗ずる
-    """
     if method in [1, 2, 3, 4]:
         return calc_daily_gdd_core(
             tmean=row["tave_this"],
@@ -333,11 +324,11 @@ def build_accumulation_dataframe(
     target_gdd: float,
     df_dl_master: pd.DataFrame
 ):
-    """
-    任意期間の積算 DataFrame を作成し、
-    target_gdd に最も近い日も返す
-    """
     validate_method_and_thresholds(method, t_base, t_ceiling)
+
+    # df_srcが空の場合は安全に空の辞書を返す
+    if df_src.empty:
+        return df_src.copy(), {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
 
     mask = (df_src["date"] >= start_date) & (df_src["date"] <= end_date)
     df = df_src.loc[mask].copy().reset_index(drop=True)
@@ -382,12 +373,7 @@ def build_accumulation_dataframe(
 # 履歴集計
 # =========================================================
 def make_hist_dict_simple_ct(date_start: date, date_end: date, df_src: pd.DataFrame):
-    """
-    開発概要の『単純な積算気温』版
-    Σ max(0, TMP_mea)
-    累積降水量 Σ prcp_this
-    """
-    if date_end < date_start:
+    if df_src.empty or date_end < date_start:
         return {"date": None, "cum_ct": None, "cum_pr": None}
 
     mask = (df_src["date"] >= date_start) & (df_src["date"] <= date_end)
@@ -426,21 +412,35 @@ def get_climate_data():
         lat = params["lat"]
         lon = params["lon"]
 
-        today, fiscal_year = get_fiscal_year_today()
+        today = datetime.utcnow().date()
+        
+        # ★アップデート1＆2：平年値(現実の年基準) と 対象年(スプレッドシートの年基準) の分離
+        fiscal_year_for_avg = today.year if today.month >= 4 else today.year - 1
+        
+        ct1_start = params["ct1_start"]
+        target_fiscal_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
+
         yesterday = today - timedelta(days=1)
         forecast_end = today + timedelta(days=26)
 
         # 0. 日長マスタ
-        df_dl_master = load_daylength_table()
+        try:
+            df_dl_master = load_daylength_table()
+        except Exception:
+            # 万が一CSVが無かった場合の安全措置
+            df_dl_master = pd.DataFrame(columns=["month_day", "DL"])
 
-        # 1. 平年値
-        df_avg = build_average_temperature(lat, lon, fiscal_year, n_years=3)
+        # 1. 平年値 (現実基準)
+        df_avg = build_average_temperature(lat, lon, fiscal_year_for_avg, n_years=3)
 
-        # 2. 今年度データ
-        df_this = build_this_year_dataframe(lat, lon, fiscal_year, today, df_avg)
+        # 2. 今年度データ (スプレッドシートの入力年基準)
+        df_this = build_this_year_dataframe(lat, lon, target_fiscal_year, today, df_avg)
 
         # 3. 予報部
-        df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
+        if not df_this.empty:
+            df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
+        else:
+            df_forecast = pd.DataFrame()
 
         # 4. ct1（絹糸発生日予測用）
         df_ct1, closest1 = build_accumulation_dataframe(
@@ -480,30 +480,31 @@ def get_climate_data():
         df_this_json = df_this.copy()
         df_forecast_json = df_forecast.copy()
 
-        df_this_json["date"] = df_this_json["date"].map(to_iso_or_none)
-        df_forecast_json["date"] = df_forecast_json["date"].map(to_iso_or_none)
+        if not df_this_json.empty:
+            df_this_json["date"] = df_this_json["date"].map(to_iso_or_none)
+        if not df_forecast_json.empty:
+            df_forecast_json["date"] = df_forecast_json["date"].map(to_iso_or_none)
+            
         df_avg_json = replace_nan_with_none(df_avg.to_dict(orient="records"))
+        
+        # DataFrameのフィルタリングもdf_thisが空の場合は空DFを返す
+        if not df_this.empty:
+            ct1_period_df = df_this.loc[(df_this["date"] >= params["ct1_start"]) & (df_this["date"] <= params["ct1_end"])].reset_index(drop=True)
+            ct2_period_df = df_this.loc[(df_this["date"] >= params["ct2_start"]) & (df_this["date"] <= params["ct2_end"])].reset_index(drop=True)
+        else:
+            ct1_period_df = pd.DataFrame()
+            ct2_period_df = pd.DataFrame()
 
         return jsonify({
             "average": df_avg_json,
             "this_year": replace_nan_with_none(df_this_json.to_dict(orient="records")),
             "forecast": replace_nan_with_none(df_forecast_json.to_dict(orient="records")),
 
-            "ct1_period": dataframe_to_records_with_iso_date(
-                df_this.loc[
-                    (df_this["date"] >= params["ct1_start"]) &
-                    (df_this["date"] <= params["ct1_end"])
-                ].reset_index(drop=True)
-            ),
+            "ct1_period": dataframe_to_records_with_iso_date(ct1_period_df),
             "ct1": dataframe_to_records_with_iso_date(df_ct1),
             "gdd1_target": replace_nan_with_none(closest1),
 
-            "ct2_period": dataframe_to_records_with_iso_date(
-                df_this.loc[
-                    (df_this["date"] >= params["ct2_start"]) &
-                    (df_this["date"] <= params["ct2_end"])
-                ].reset_index(drop=True)
-            ),
+            "ct2_period": dataframe_to_records_with_iso_date(ct2_period_df),
             "ct2": dataframe_to_records_with_iso_date(df_ct2),
             "gdd2_target": replace_nan_with_none(closest2),
 
@@ -514,12 +515,14 @@ def get_climate_data():
                 "today_utc": today.isoformat(),
                 "yesterday_utc": yesterday.isoformat(),
                 "forecast_end_utc": forecast_end.isoformat(),
-                "fiscal_year": fiscal_year,
+                "fiscal_year_avg": fiscal_year_for_avg,     # 追記：計算基準となった平年値の年度
+                "fiscal_year_target": target_fiscal_year,   # 追記：計算基準となった実測値の年度
                 "daylength_csv": str(DL_CSV_PATH.name)
             }
         })
 
     except Exception as e:
+        # 万が一想定外のエラーが起きても、500エラーではなく400として安全にメッセージを返す
         return jsonify({
             "status": "error",
             "message": str(e)
