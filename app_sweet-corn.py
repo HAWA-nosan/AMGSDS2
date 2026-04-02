@@ -17,32 +17,15 @@ app = Flask(__name__)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
-def fetch_met_data(element, start_str, end_str, lat, lon):
+# ★爆速化：まとめて数年分のデータを1回で取得・キャッシュする
+@lru_cache(maxsize=64)
+def fetch_met_data_bulk(element, start_str, end_str, lat, lon):
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
         s_dates = pd.to_datetime(pd.Series(list(tim)))
         return pd.DataFrame({"date": s_dates.dt.normalize(), element: val[:, 0, 0]})
     except Exception:
         return pd.DataFrame(columns=["date", element])
-
-@lru_cache(maxsize=128)
-def get_cached_avg_data(year, lat, lon):
-    df_t = fetch_met_data("TMP_mea", f"{year}-04-01", f"{year+1}-03-31", lat, lon)
-    if df_t.empty: return None
-    df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
-    return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
-
-@lru_cache(maxsize=64)
-def get_cached_past_year(py_start, py_end, lat, lon):
-    df_t = fetch_met_data("TMP_mea", py_start, py_end, lat, lon)
-    df_p = fetch_met_data("APCPRA", py_start, py_end, lat, lon)
-    if df_t.empty and df_p.empty: return None
-    if not df_t.empty and not df_p.empty: df = df_t.merge(df_p, on="date", how="outer")
-    else: df = df_t if not df_t.empty else df_p
-    if "TMP_mea" not in df.columns: df["TMP_mea"] = np.nan
-    if "APCPRA" not in df.columns: df["APCPRA"] = 0.0
-    df.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
-    return df
 
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
@@ -63,10 +46,14 @@ def get_climate_data():
         current_year = today.year if today.month >= 4 else today.year - 1
         target_year = ct1_start_ts.year if ct1_start_ts.month >= 4 else ct1_start_ts.year - 1
 
-        all_years_data = [res for y in range(current_year - 3, current_year) if (res := get_cached_avg_data(y, lat, lon)) is not None]
-
-        if all_years_data:
-            df_avg = pd.concat(all_years_data).groupby("month_day", as_index=False).mean()
+        # 1. 平年値の計算（過去3年分を1回の通信でまとめて取得！）
+        start_avg = f"{current_year - 3}-04-01"
+        end_avg = f"{current_year}-03-31"
+        df_avg_all = fetch_met_data_bulk("TMP_mea", start_avg, end_avg, lat, lon)
+        
+        if not df_avg_all.empty:
+            df_avg_all["month_day"] = df_avg_all["date"].dt.strftime("%m-%d")
+            df_avg = df_avg_all.groupby("month_day", as_index=False).mean()
             df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
             df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
             idx_m = df_avg.index[df_avg["month_day"] == "04-01"]
@@ -76,20 +63,22 @@ def get_climate_data():
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        df_available_list = []
-        df_py = get_cached_past_year(f"{current_year-1}-04-01", f"{current_year}-03-31", lat, lon)
-        if df_py is not None: df_available_list.append(df_py.copy())
+        # 2. 実測値＋予報値の収集（過去1年分＋今年度分を1回の通信でまとめて取得！）
+        start_real = f"{current_year - 1}-04-01"
+        end_real = f"{current_year + 1}-03-31"
+        df_cy_t = fetch_met_data_bulk("TMP_mea", start_real, end_real, lat, lon)
+        df_cy_p = fetch_met_data_bulk("APCPRA", start_real, end_real, lat, lon)
         
-        df_cy_t = fetch_met_data("TMP_mea", f"{current_year}-04-01", f"{current_year+1}-03-31", lat, lon)
-        df_cy_p = fetch_met_data("APCPRA", f"{current_year}-04-01", f"{current_year+1}-03-31", lat, lon)
         if not df_cy_t.empty or not df_cy_p.empty:
             df_cy = df_cy_t.merge(df_cy_p, on="date", how="outer") if (not df_cy_t.empty and not df_cy_p.empty) else (df_cy_t if not df_cy_t.empty else df_cy_p)
             if "TMP_mea" not in df_cy.columns: df_cy["TMP_mea"] = np.nan
-            if "APCPRA" not in df_cy.columns: df_cy["APCPRA"] = np.nan
+            if "APCPRA" not in df_cy.columns: df_cy["APCPRA"] = 0.0
             df_cy.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
-            df_available_list.append(df_cy)
+            df_available = df_cy.drop_duplicates(subset=["date"], keep="last")
+        else:
+            df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        df_available = pd.concat(df_available_list).drop_duplicates(subset=["date"], keep="last") if df_available_list else pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
+        # 3. タイムライン作成
         df_this = pd.DataFrame({"date": pd.date_range(start=f"{target_year}-04-01", end=f"{target_year+1}-03-31")})
         df_this["tag"] = df_this["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
         df_this["month_day"] = df_this["date"].dt.strftime("%m-%d")
@@ -103,6 +92,7 @@ def get_climate_data():
         mask_f = (df_this["date"] >= (today - pd.Timedelta(days=1))) & (df_this["date"] <= (today + pd.Timedelta(days=7)))
         df_forecast = df_this.loc[mask_f].copy() if mask_f.any() else pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
+        # 4. 積算計算
         def calc_acc(df_timeline, s_str, e_str, thresh, target):
             if not s_str or not e_str: return None, {}
             mask = (df_timeline["date"] >= pd.to_datetime(s_str)) & (df_timeline["date"] <= pd.to_datetime(e_str))
