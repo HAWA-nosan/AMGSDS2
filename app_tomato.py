@@ -24,7 +24,7 @@ def fetch_met_data(element, start_str, end_str, lat, lon):
 
 @lru_cache(maxsize=128)
 def get_cached_avg_data(year, lat, lon):
-    """過去3年の平年値は「気温」だけを計算する（雨量の平年値はノイズになるため不要）"""
+    """過去3年の平年値は「気温」だけを計算する（雨量の平年値はノイズになるため不要！）"""
     start_str = f"{year}-04-01"
     end_str = f"{year+1}-03-31"
     
@@ -33,7 +33,7 @@ def get_cached_avg_data(year, lat, lon):
         return None
         
     df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
-    return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave"})
+    return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
 
 @lru_cache(maxsize=64)
 def get_cached_past_year(py_start, py_end, lat, lon):
@@ -60,12 +60,19 @@ def get_climate_data():
         d = request.get_json()
         lat, lon = map(float, (d["lat"], d["lon"]))
         
-        threshold = float(d["threshold"])
+        threshold1 = float(d["threshold"])
         gdd1_target = float(d["gdd1"])
         hosei = float(d.get("hosei", 0.0))
-        
         ct1_start_str = d.get("ct1_start")
         ct1_end_str = d.get("ct1_end")
+
+        # 単一積算か2段階積算かを自動判定
+        is_double = "ct2_start" in d
+        if is_double:
+            threshold2 = float(d.get("threshold2", threshold1))
+            gdd2_target = float(d.get("gdd2", 0))
+            ct2_start_str = d.get("ct2_start")
+            ct2_end_str = d.get("ct2_end")
         
         today = pd.Timestamp(datetime.utcnow().date())
         yesterday = today - pd.Timedelta(days=1)
@@ -87,7 +94,7 @@ def get_climate_data():
         if all_years_data:
             df_concat = pd.concat(all_years_data)
             df_avg = df_concat.groupby("month_day", as_index=False).mean()
-            df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
+            df_avg.rename(columns={"tave_avg": "tave_avg"}, inplace=True)
             df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
             df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
@@ -147,7 +154,7 @@ def get_climate_data():
         else:
             df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        # 3. 365日予測タイムライン（気温はハイブリッド、未来の雨量はゼロ）
+        # 3. 365日予測タイムラインの作成
         start_this = pd.to_datetime(f"{target_year}-04-01")
         end_this = pd.to_datetime(f"{target_year + 1}-03-31")
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this)})
@@ -171,15 +178,16 @@ def get_climate_data():
             df_this["tave_real"] = np.nan
             df_this["prcp_real"] = np.nan
 
-        # 気温の織り交ぜ（未来は平年値）
-        df_this["tave_this"] = df_this["tave_real"]
         mask_normal = df_this["tag"] == "normal"
+        
+        # 気温：未来は平年値で埋める
+        df_this["tave_this"] = df_this["tave_real"]
         df_this.loc[mask_normal, "tave_this"] = np.nan 
         df_this["tave_this"] = df_this["tave_this"].fillna(df_this["tave_avg"]).round(1)
         
-        # 降水量の織り交ぜ（未来は 0.0 にして非表示にする！）
+        # 雨量：未来は一旦 0.0 にして積算エラーを防ぐ（後で表示用に完全消去します）
         df_this["prcp_this"] = df_this["prcp_real"]
-        df_this.loc[mask_normal, "prcp_this"] = np.nan 
+        df_this.loc[mask_normal, "prcp_this"] = 0.0 
         df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
         
         df_this.drop(columns=["month_day", "tave_avg", "tave_real", "prcp_real"], inplace=True)
@@ -216,67 +224,100 @@ def get_climate_data():
                 
             df_forecast = df_fb.drop(columns=["month_day", "tave_avg"], errors='ignore')
 
-        # 5. 積算計算 (CT1のみ)
-        if not ct1_start_str or not ct1_end_str:
-            df_ct1 = pd.DataFrame()
-            closest_dict, corrected_dict, hist_dict = {}, {}, {}
-        else:
-            mask_ct = (df_this["date"] >= ct1_start_ts) & (df_this["date"] <= pd.to_datetime(ct1_end_str))
-            df_ct1 = df_this.loc[mask_ct].copy().reset_index(drop=True)
-            
-            if df_ct1.empty:
-                closest_dict, corrected_dict, hist_dict = {}, {}, {}
-            else:
-                df_ct1["daily_ct"] = (df_ct1["tave_this"] - threshold).clip(lower=0).round(1)
-                df_ct1["cum_ct"] = df_ct1["daily_ct"].cumsum().round(1)
-                df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
-                df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
+        # 5. 積算計算 (CT1, CT2)
+        def calc_accumulation(df_timeline, start_str, end_str, thresh, target):
+            if not start_str or not end_str:
+                return pd.DataFrame(), {}, {}, {}
                 
-                df_ct1["abs_diff"] = (df_ct1["cum_ct"] - gdd1_target).abs()
-                row_close = df_ct1.loc[df_ct1["abs_diff"].idxmin()]
-                closest_dict = {
-                    "date": row_close["date"].strftime("%Y-%m-%d"),
-                    "cum_ct": round(row_close["cum_ct"], 1)
-                }
+            s_date = pd.to_datetime(start_str)
+            e_date = pd.to_datetime(end_str)
+            
+            mask = (df_timeline["date"] >= s_date) & (df_timeline["date"] <= e_date)
+            df_ct = df_timeline.loc[mask].copy().reset_index(drop=True)
+            
+            if df_ct.empty:
+                return pd.DataFrame(), {}, {}, {}
+                
+            df_ct["daily_ct"] = (df_ct["tave_this"] - thresh).clip(lower=0).round(1)
+            df_ct["cum_ct"] = df_ct["daily_ct"].cumsum().round(1)
+            df_ct["daily_pr"] = df_ct["prcp_this"].round(1)
+            df_ct["cum_pr"] = df_ct["daily_pr"].cumsum().round(1)
+            
+            # ================================================================
+            # ★ 究極のグラフスッキリ化！
+            # 26日先以降の未来の雨量は「空欄(NaN)」に書き換えることで、
+            # スプレッドシートのグラフ上で赤い棒がピタッと止まり非表示になります。
+            # ================================================================
+            mask_future = df_ct["date"] > forecast_end
+            df_ct.loc[mask_future, "daily_pr"] = np.nan
+            df_ct.loc[mask_future, "cum_pr"] = np.nan
+            
+            df_ct["abs_diff"] = (df_ct["cum_ct"] - target).abs()
+            row_close = df_ct.loc[df_ct["abs_diff"].idxmin()]
+            closest_dict = {
+                "date": row_close["date"].strftime("%Y-%m-%d"),
+                "cum_ct": round(row_close["cum_ct"], 1)
+            }
 
-                df_ct1["corrected_cum_ct"] = df_ct1["cum_ct"] + hosei
-                df_ct1["abs_diff_corr"] = (df_ct1["corrected_cum_ct"] - gdd1_target).abs()
-                row_corr = df_ct1.loc[df_ct1["abs_diff_corr"].idxmin()]
+            if target > 0:
+                df_ct["corrected_cum_ct"] = df_ct["cum_ct"] + hosei
+                df_ct["abs_diff_corr"] = (df_ct["corrected_cum_ct"] - target).abs()
+                row_corr = df_ct.loc[df_ct["abs_diff_corr"].idxmin()]
                 corrected_dict = {
                     "date": row_corr["date"].strftime("%Y-%m-%d"),
                     "cum_ct": round(row_corr["corrected_cum_ct"], 1)
                 }
+            else:
+                corrected_dict = {}
                 
-                mask_hist = df_ct1["date"] <= yesterday
-                if mask_hist.any():
-                    row_hist = df_ct1.loc[mask_hist].iloc[-1]
-                    hist_dict = {
-                        "cum_ct": round(row_hist["cum_ct"], 1),
-                        "cum_pr": round(row_hist["cum_pr"], 1)
-                    }
-                else:
-                    hist_dict = {}
+            mask_hist = df_ct["date"] <= yesterday
+            if mask_hist.any():
+                row_hist = df_ct.loc[mask_hist].iloc[-1]
+                hist_dict = {
+                    "cum_ct": round(row_hist["cum_ct"], 1),
+                    "cum_pr": round(row_hist["cum_pr"], 1)
+                }
+            else:
+                hist_dict = {}
+                
+            return df_ct, closest_dict, corrected_dict, hist_dict
+
+        df_ct1, closest_dict1, corrected_dict1, hist_dict1 = calc_accumulation(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
+        
+        df_ct2 = pd.DataFrame()
+        closest_dict2 = {}
+        hist_dict2 = {}
+        if is_double:
+            df_ct2, closest_dict2, _, hist_dict2 = calc_accumulation(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
 
         # 6. JSONデータのクリーンアップ
         def replace_nan(d):
             if isinstance(d, list): return [replace_nan(x) for x in d]
             if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
-            if isinstance(d, float) and math.isnan(d): return None
+            if isinstance(d, float) and math.isnan(d): return None # NaNはNone(空欄)に変換
             return d
 
         df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
         df_forecast["date"] = df_forecast["date"].dt.strftime("%Y-%m-%d")
         if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct2.empty: df_ct2["date"] = df_ct2["date"].dt.strftime("%Y-%m-%d")
 
-        return jsonify({
+        res_dict = {
             "average": replace_nan(df_avg.to_dict(orient="records")),
             "this_year": replace_nan(df_this.to_dict(orient="records")),
             "forecast": replace_nan(df_forecast.to_dict(orient="records")),
             "ct1": replace_nan(df_ct1.to_dict(orient="records")),
-            "gdd1_target": closest_dict,
-            "gdd1_target_corr": corrected_dict,
-            "ct1_until_yesterday": hist_dict
-        })
+            "gdd1_target": closest_dict1,
+            "gdd1_target_corr": corrected_dict1,
+            "ct1_until_yesterday": hist_dict1,
+        }
+        
+        if is_double:
+            res_dict["ct2"] = replace_nan(df_ct2.to_dict(orient="records"))
+            res_dict["gdd2_target"] = closest_dict2
+            res_dict["ct2_until_yesterday"] = hist_dict2
+
+        return jsonify(res_dict)
     except Exception as e:
         import traceback
         traceback.print_exc()
