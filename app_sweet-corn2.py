@@ -60,8 +60,9 @@ def parse_request_payload(d: dict) -> dict:
         "ceiling_threshold2": parse_float(d.get("ceiling_threshold2"), allow_none=True), "gdd2_target": parse_float(d.get("gdd2_target", 0)),
     }
 
-@lru_cache(maxsize=256)
-def fetch_point_series(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
+# ★爆速化：まとめて数年分のデータを1回で取得する
+@lru_cache(maxsize=64)
+def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
     try:
         arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [lat, lat, lon, lon])
         values = arr[:, 0, 0]
@@ -72,25 +73,18 @@ def fetch_point_series(var_name: str, start_date: str, end_date: str, lat: float
         return [], []
 
 def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years: int = 3) -> pd.DataFrame:
-    all_years = []
-    start_year = fiscal_year - n_years
-    for year in range(start_year, fiscal_year):
-        start, end = f"{year}-04-01", f"{year + 1}-03-31"
-        dates, tmean = fetch_point_series("TMP_mea", start, end, lat, lon)
-        _, tmax = fetch_point_series("TMP_max", start, end, lat, lon)
-        _, tmin = fetch_point_series("TMP_min", start, end, lat, lon)
-        if dates:
-            df = pd.DataFrame({"datetime": pd.to_datetime(dates), "tave": tmean, "tmax": tmax, "tmin": tmin})
-            df["month_day"] = df["datetime"].dt.strftime("%m-%d")
-            all_years.append(df[["month_day", "tave", "tmax", "tmin"]])
-
-    if not all_years: return pd.DataFrame(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg"])
-    df_concat = pd.concat(all_years, ignore_index=True)
-    df_avg = df_concat.groupby("month_day", as_index=False).mean()
+    start_avg, end_avg = f"{fiscal_year - n_years}-04-01", f"{fiscal_year}-03-31"
+    dates, tmean = fetch_point_series_bulk("TMP_mea", start_avg, end_avg, lat, lon)
+    _, tmax = fetch_point_series_bulk("TMP_max", start_avg, end_avg, lat, lon)
+    _, tmin = fetch_point_series_bulk("TMP_min", start_avg, end_avg, lat, lon)
+    
+    if not dates: return pd.DataFrame(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg"])
+    
+    df = pd.DataFrame({"datetime": pd.to_datetime(dates), "tave": tmean, "tmax": tmax, "tmin": tmin})
+    df["month_day"] = df["datetime"].dt.strftime("%m-%d")
+    df_avg = df.groupby("month_day", as_index=False).mean()
     df_avg.rename(columns={"tave": "tave_avg", "tmax": "tmax_avg", "tmin": "tmin_avg"}, inplace=True)
-    df_avg["tave_avg"] = df_avg["tave_avg"].round(1)
-    df_avg["tmax_avg"] = df_avg["tmax_avg"].round(1)
-    df_avg["tmin_avg"] = df_avg["tmin_avg"].round(1)
+    df_avg["tave_avg"], df_avg["tmax_avg"], df_avg["tmin_avg"] = df_avg["tave_avg"].round(1), df_avg["tmax_avg"].round(1), df_avg["tmin_avg"].round(1)
 
     df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
     df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
@@ -102,30 +96,29 @@ def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years:
 def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: date, df_avg: pd.DataFrame) -> pd.DataFrame:
     start_this = pd.to_datetime(f"{fiscal_year}-04-01").date()
     end_this = pd.to_datetime(f"{fiscal_year + 1}-03-31").date()
-    
-    # 欠損日を防ぐため、365日分のカレンダー枠を完全に作る
     df = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
 
     yesterday, forecast_end = today - timedelta(days=1), today + timedelta(days=26)
     df["tag"] = df["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
 
-    df_avail_list = []
-    for fy in [fiscal_year - 1, fiscal_year]:
-        s, e = f"{fy}-04-01", f"{fy+1}-03-31"
-        dates, tmean = fetch_point_series("TMP_mea", s, e, lat, lon)
-        _, tmax = fetch_point_series("TMP_max", s, e, lat, lon)
-        _, tmin = fetch_point_series("TMP_min", s, e, lat, lon)
-        _, prcp = fetch_point_series("APCPRA", s, e, lat, lon)
-        if dates:
-            df_avail_list.append(pd.DataFrame({"date": dates, "tave_real": tmean, "tmax_real": tmax, "tmin_real": tmin, "prcp_real": prcp}))
+    # 過去と今年のデータをまとめて1回で取得
+    s_real, e_real = f"{fiscal_year-1}-04-01", f"{fiscal_year+1}-03-31"
+    dates, tmean = fetch_point_series_bulk("TMP_mea", s_real, e_real, lat, lon)
+    _, tmax = fetch_point_series_bulk("TMP_max", s_real, e_real, lat, lon)
+    _, tmin = fetch_point_series_bulk("TMP_min", s_real, e_real, lat, lon)
+    _, prcp = fetch_point_series_bulk("APCPRA", s_real, e_real, lat, lon)
     
-    if df_avail_list:
-        df_avail = pd.concat(df_avail_list).drop_duplicates(subset=["date"], keep="last")
+    if dates:
+        df_avail = pd.DataFrame({"date": dates, "tave_real": tmean, "tmax_real": tmax, "tmin_real": tmin, "prcp_real": prcp})
+        df_avail = df_avail.drop_duplicates(subset=["date"], keep="last")
     else:
         df_avail = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
 
-    df = df.merge(df_avail, on="date", how="left")
-    df["month_day"] = pd.to_datetime(df["date"]).dt.strftime("%m-%d")
+    df["date_ts"] = pd.to_datetime(df["date"])
+    df_avail["date_ts"] = pd.to_datetime(df_avail["date"])
+    df = df.merge(df_avail.drop(columns=["date"]), left_on="date_ts", right_on="date_ts", how="left")
+    
+    df["month_day"] = df["date_ts"].dt.strftime("%m-%d")
     
     if not df_avg.empty:
         df = df.merge(df_avg[["month_day", "tave_avg", "tmax_avg", "tmin_avg"]], on="month_day", how="left")
@@ -142,7 +135,7 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
     df.loc[mask_normal, "prcp_this"] = 0.0
     df["prcp_this"] = df["prcp_this"].astype(float).fillna(0.0).round(1)
 
-    df.drop(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
+    df.drop(columns=["month_day", "date_ts", "tave_avg", "tmax_avg", "tmin_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
     return df
 
 def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
@@ -153,10 +146,7 @@ def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
     return df_dl.drop_duplicates(subset=["month_day"]).reset_index(drop=True)[["month_day", "DL"]]
 
 def add_daylength_from_csv(df: pd.DataFrame, df_dl_master: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        out = df.copy()
-        out["DL_hours"] = pd.Series(dtype=float)
-        return out
+    if df.empty: return df.assign(DL_hours=pd.Series(dtype=float))
     out = df.copy()
     out["month_day"] = pd.to_datetime(out["date"]).dt.strftime("%-m/%-d")
     out = out.merge(df_dl_master, on="month_day", how="left")
@@ -202,7 +192,6 @@ def build_accumulation_dataframe(df_src: pd.DataFrame, start_date: date, end_dat
     df["daily_pr"] = df["prcp_this"].round(1)
     df["cum_pr"] = df["daily_pr"].cumsum().round(1)
     
-    # ★ 未来の雨量は完全に消す
     forecast_end_date = datetime.utcnow().date() + timedelta(days=26)
     mask_future = df["date"] > forecast_end_date
     df.loc[mask_future, ["daily_pr", "cum_pr"]] = np.nan
@@ -253,7 +242,6 @@ def get_climate_data():
 
         df_ct1, closest1 = build_accumulation_dataframe(df_this, params["ct1_start"], params["ct1_end"], params["method1"], params["base_threshold1"], params["ceiling_threshold1"], params["gdd1_target"], df_dl_master)
         
-        # B13が空欄だった場合はCT1の達成日を引き継ぐ
         ct2_start_calc = params["ct2_start"] if params["ct2_start"] else (to_date(closest1["date"]) if closest1.get("date") else today)
         ct2_end_calc = params["ct2_end"] if params["ct2_end"] else pd.to_datetime(f"{target_fiscal_year+1}-03-31").date()
         
