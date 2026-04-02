@@ -89,57 +89,32 @@ def get_climate_data():
                 df_this.drop(columns=["month_day"], inplace=True)
 
         # ====================================================================
-        # ★ 予報部分の究極の解決策：年度またぎエラーを回避！
-        # 今年度と昨年度を別々に取得して結合し、そこから9日間を切り出す。
+        # ★ 予報部分の【無敵】取得ロジック
+        # 4月上旬特有の「最新の実測データファイル未作成エラー(404)」を回避するため、
+        # 「昨日」から取得してみて失敗したら「今日」「明日」と未来にずらして再挑戦する。
         # ====================================================================
-        df_real_list = []
+        df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
+        f_end_date = today + timedelta(days=7)
         
-        # 1) 今年度データの追加（すでに取得済みなら再利用して高速化）
-        if target_year == current_year and not df_this.empty:
-            df_real_list.append(df_this)
-        else:
+        # offset: -1(昨日), 0(今日), 1(明日), 2(明後日)...
+        for offset in [-1, 0, 1, 2, 3]:
             try:
-                cy_start = f"{current_year}-04-01"
-                cy_end   = f"{current_year+1}-03-31"
-                t1, tim1, *_ = amd.GetMetData("TMP_mea", [cy_start, cy_end], [lat, lat, lon, lon])
-                p1, *_       = amd.GetMetData("APCPRA", [cy_start, cy_end], [lat, lat, lon, lon])
-                df_cy = pd.DataFrame({
-                    "date": pd.to_datetime(tim1).map(lambda d: d.date()),
-                    "tave_this": t1[:, 0, 0],
-                    "prcp_this": p1[:, 0, 0]
+                start_d = today + timedelta(days=offset)
+                if start_d > f_end_date:
+                    break
+                f_t, f_tim, *_ = amd.GetMetData("TMP_mea", [start_d.isoformat(), f_end_date.isoformat()], [lat, lat, lon, lon])
+                f_p, *_ = amd.GetMetData("APCPRA", [start_d.isoformat(), f_end_date.isoformat()], [lat, lat, lon, lon])
+                df_forecast = pd.DataFrame({
+                    "date": pd.to_datetime(f_tim).map(lambda d: d.date()),
+                    "tave_this": f_t[:, 0, 0],
+                    "prcp_this": f_p[:, 0, 0]
                 })
-                df_real_list.append(df_cy)
-            except Exception:
-                pass
-
-        # 2) 昨年度データの追加（今日が4月上旬の場合、「昨日」が3月に含まれるため必須！）
-        if today.month == 4 and today.day <= 7:
-            if target_year == current_year - 1 and not df_this.empty:
-                df_real_list.append(df_this)
-            else:
-                try:
-                    py_start = f"{current_year-1}-04-01"
-                    py_end   = f"{current_year}-03-31"
-                    t2, tim2, *_ = amd.GetMetData("TMP_mea", [py_start, py_end], [lat, lat, lon, lon])
-                    p2, *_       = amd.GetMetData("APCPRA", [py_start, py_end], [lat, lat, lon, lon])
-                    df_py = pd.DataFrame({
-                        "date": pd.to_datetime(tim2).map(lambda d: d.date()),
-                        "tave_this": t2[:, 0, 0],
-                        "prcp_this": p2[:, 0, 0]
-                    })
-                    df_real_list.append(df_py)
-                except Exception:
-                    pass
-
-        # 3) ガチャンと結合して9日間を切り出し
-        if df_real_list:
-            df_real = pd.concat(df_real_list).reset_index(drop=True)
-            f_start_date = today - timedelta(days=1)
-            f_end_date   = today + timedelta(days=7)
-            mask_f = (df_real["date"] >= f_start_date) & (df_real["date"] <= f_end_date)
-            df_forecast = df_real.loc[mask_f].reset_index(drop=True)
-        else:
-            df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
+                # データ取得に成功したらループを抜ける！
+                break
+            except Exception as e:
+                # 失敗した場合はログに残し、翌日スタートにずらして再挑戦
+                print(f"Forecast fetch failed for offset {offset} ({start_d}):", e)
+                continue
         # ====================================================================
 
         # 3. 積算範囲 (CT1) の計算
