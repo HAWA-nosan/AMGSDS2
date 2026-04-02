@@ -54,7 +54,7 @@ def get_climate_data():
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # 2. 実測値と降水量の取得
+        # 2. 実測値と降水量の取得（対象年度：スプレッドシート指定の年）
         start_this = f"{target_year}-04-01"
         end_this = f"{target_year + 1}-03-31"
         try:
@@ -88,17 +88,23 @@ def get_climate_data():
             else:
                 df_this.drop(columns=["month_day"], inplace=True)
 
-        # ★ 予報部分: 常に「現実の昨日〜7日後（計9日間）」の最新予報を取得
-        f_start = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        f_end   = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+        # ★ 予報部分の修正：現実の今年度データを丸ごと取得して、9日間だけ切り出す！
+        real_start = f"{current_year}-04-01"
+        real_end   = f"{current_year + 1}-03-31"
         try:
-            f_temp, f_tim, *_ = amd.GetMetData("TMP_mea", [f_start, f_end], [lat, lat, lon, lon])
-            f_prcp, *_ = amd.GetMetData("APCPRA", [f_start, f_end], [lat, lat, lon, lon])
-            df_forecast = pd.DataFrame({
-                "date": pd.to_datetime(f_tim).map(lambda d: d.date()),
-                "tave_this": f_temp[:, 0, 0],
-                "prcp_this": f_prcp[:, 0, 0]
+            r_temp, r_tim, *_ = amd.GetMetData("TMP_mea", [real_start, real_end], [lat, lat, lon, lon])
+            r_prcp, *_ = amd.GetMetData("APCPRA", [real_start, real_end], [lat, lat, lon, lon])
+            df_real = pd.DataFrame({
+                "date": pd.to_datetime(r_tim).map(lambda d: d.date()),
+                "tave_this": r_temp[:, 0, 0],
+                "prcp_this": r_prcp[:, 0, 0]
             })
+            
+            # 昨日から7日後までの9日間を抽出
+            f_start_date = today - timedelta(days=1)
+            f_end_date   = today + timedelta(days=7)
+            mask_f = (df_real["date"] >= f_start_date) & (df_real["date"] <= f_end_date)
+            df_forecast = df_real.loc[mask_f].reset_index(drop=True)
         except Exception:
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
@@ -144,7 +150,7 @@ def get_climate_data():
             else:
                 hist_dict = {}
 
-        # 4. JSONデータのクリーンアップ（NaN対策）
+        # 4. JSONデータのクリーンアップ
         def replace_nan(d):
             if isinstance(d, list): return [replace_nan(x) for x in d]
             if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
