@@ -54,7 +54,7 @@ def get_climate_data():
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # 2. 実測値と降水量の取得（対象年度：スプレッドシート指定の年）
+        # 2. 実測値と降水量の取得（スプレッドシート指定の年）
         start_this = f"{target_year}-04-01"
         end_this = f"{target_year + 1}-03-31"
         try:
@@ -88,12 +88,17 @@ def get_climate_data():
             else:
                 df_this.drop(columns=["month_day"], inplace=True)
 
-        # ★ 予報部分の修正：現実の今年度データを丸ごと取得して、9日間だけ切り出す！
-        real_start = f"{current_year}-04-01"
-        real_end   = f"{current_year + 1}-03-31"
+        # ====================================================================
+        # ★ 予報部分の確実な取得方法：
+        # APIのエラーを防ぐため「30日前〜26日後」の安全な範囲で取得し、
+        # その中から「昨日〜7日後」の9日間だけを切り出す。
+        # ====================================================================
+        r_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        r_end   = (today + timedelta(days=26)).strftime("%Y-%m-%d")
         try:
-            r_temp, r_tim, *_ = amd.GetMetData("TMP_mea", [real_start, real_end], [lat, lat, lon, lon])
-            r_prcp, *_ = amd.GetMetData("APCPRA", [real_start, real_end], [lat, lat, lon, lon])
+            r_temp, r_tim, *_ = amd.GetMetData("TMP_mea", [r_start, r_end], [lat, lat, lon, lon])
+            r_prcp, *_ = amd.GetMetData("APCPRA", [r_start, r_end], [lat, lat, lon, lon])
+            
             df_real = pd.DataFrame({
                 "date": pd.to_datetime(r_tim).map(lambda d: d.date()),
                 "tave_this": r_temp[:, 0, 0],
@@ -105,8 +110,11 @@ def get_climate_data():
             f_end_date   = today + timedelta(days=7)
             mask_f = (df_real["date"] >= f_start_date) & (df_real["date"] <= f_end_date)
             df_forecast = df_real.loc[mask_f].reset_index(drop=True)
-        except Exception:
+            
+        except Exception as e:
+            print("Forecast Error:", e) # レンダーのログに原因を残す
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
+        # ====================================================================
 
         # 3. 積算範囲 (CT1) の計算
         if not df_this.empty:
