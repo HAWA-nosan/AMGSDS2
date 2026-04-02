@@ -1,12 +1,47 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 import math
 import AMD_Tools4 as amd
 
 app = Flask(__name__)
+
+# ====================================================================
+# ★ 爆速化の要（キャッシュシステム）
+# 過去のデータは変化しないため、一度取得したものはメモリに暗記させます。
+# これにより、複数シートを一括更新する際の通信時間を極限まで削ります！
+# ====================================================================
+@lru_cache(maxsize=128)
+def get_cached_avg_data(year, lat, lon):
+    start_str = f"{year}-04-01"
+    end_str = f"{year+1}-03-31"
+    try:
+        temp, tim, *_ = amd.GetMetData("TMP_mea", [start_str, end_str], [lat, lat, lon, lon])
+        df = pd.DataFrame({
+            "datetime": pd.to_datetime(tim),
+            "tave": temp[:, 0, 0]
+        })
+        df["month_day"] = df["datetime"].dt.strftime("%m-%d")
+        return df[["month_day", "tave"]]
+    except Exception:
+        return None
+
+@lru_cache(maxsize=64)
+def get_cached_past_year(py_start, py_end, lat, lon):
+    try:
+        t_py, tim_py, *_ = amd.GetMetData("TMP_mea", [py_start, py_end], [lat, lat, lon, lon])
+        p_py, *_       = amd.GetMetData("APCPRA", [py_start, py_end], [lat, lat, lon, lon])
+        return pd.DataFrame({
+            "date": pd.to_datetime(tim_py).dt.normalize(),
+            "tave_real": t_py[:, 0, 0],
+            "prcp_real": p_py[:, 0, 0]
+        })
+    except Exception:
+        return None
+# ====================================================================
 
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
@@ -17,7 +52,6 @@ def get_climate_data():
         gdd1_target = float(d["gdd1"])
         hosei = float(d.get("hosei", 0.0))
         
-        # 日付フォーマットを強固な pandas.Timestamp に統一！
         ct1_start = pd.to_datetime(d["ct1_start"])
         ct1_end   = pd.to_datetime(d["ct1_end"])
         
@@ -30,21 +64,12 @@ def get_climate_data():
         start_year_for_avg = current_year - 3
         target_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
 
-        # 1. 平年値の計算
+        # 1. 平年値の計算（キャッシュを利用して爆速化）
         all_years_data = []
         for year in range(start_year_for_avg, start_year_for_avg + 3):
-            start_str = f"{year}-04-01"
-            end_str = f"{year+1}-03-31"
-            try:
-                temp, tim, *_ = amd.GetMetData("TMP_mea", [start_str, end_str], [lat, lat, lon, lon])
-                df = pd.DataFrame({
-                    "datetime": pd.to_datetime(tim),
-                    "tave": temp[:, 0, 0]
-                })
-                df["month_day"] = df["datetime"].dt.strftime("%m-%d")
-                all_years_data.append(df[["month_day", "tave"]])
-            except Exception:
-                pass
+            res = get_cached_avg_data(year, lat, lon)
+            if res is not None:
+                all_years_data.append(res.copy()) # 安全のためコピー
 
         if all_years_data:
             df_concat = pd.concat(all_years_data)
@@ -61,21 +86,14 @@ def get_climate_data():
         # 2. 全ての取得可能な「実測値」＋「26日後までの予報値」をかき集める
         df_available_list = []
         
-        # 昨年度データ
-        try:
-            py_start = f"{current_year-1}-04-01"
-            py_end   = f"{current_year}-03-31"
-            t_py, tim_py, *_ = amd.GetMetData("TMP_mea", [py_start, py_end], [lat, lat, lon, lon])
-            p_py, *_       = amd.GetMetData("APCPRA", [py_start, py_end], [lat, lat, lon, lon])
-            df_available_list.append(pd.DataFrame({
-                "date": pd.to_datetime(tim_py).dt.normalize(),
-                "tave_real": t_py[:, 0, 0],
-                "prcp_real": p_py[:, 0, 0]
-            }))
-        except Exception:
-            pass
+        # 昨年度データ（キャッシュを利用して爆速化）
+        py_start = f"{current_year-1}-04-01"
+        py_end   = f"{current_year}-03-31"
+        df_py = get_cached_past_year(py_start, py_end, lat, lon)
+        if df_py is not None:
+            df_available_list.append(df_py.copy())
 
-        # 今年度データ（実測＋予報26日分）
+        # 今年度データ（最新の予報が含まれるため、これだけは毎回取得する）
         try:
             cy_start = f"{current_year}-04-01"
             cy_end   = f"{current_year+1}-03-31"
@@ -109,9 +127,7 @@ def get_climate_data():
         else:
             df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        # ====================================================================
         # 3. 指定された年度の「完璧に織り交ぜられた」365日予測タイムラインを作成
-        # ====================================================================
         start_this = pd.to_datetime(f"{target_year}-04-01")
         end_this = pd.to_datetime(f"{target_year + 1}-03-31")
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this)})
@@ -124,20 +140,17 @@ def get_climate_data():
         df_this["tag"] = df_this["date"].apply(assign_tag)
         df_this["month_day"] = df_this["date"].dt.strftime("%m-%d")
 
-        # 平年値を結合
         if not df_avg.empty:
             df_this = df_this.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
         else:
             df_this["tave_avg"] = 10.0
 
-        # 実測・予報データを結合
         if not df_available.empty:
             df_this = df_this.merge(df_available, on="date", how="left")
         else:
             df_this["tave_real"] = np.nan
             df_this["prcp_real"] = np.nan
 
-        # 織り交ぜ処理
         df_this["tave_this"] = df_this["tave_real"]
         mask_normal = df_this["tag"] == "normal"
         df_this.loc[mask_normal, "tave_this"] = np.nan 
@@ -145,7 +158,6 @@ def get_climate_data():
         df_this["prcp_this"] = df_this["prcp_real"].fillna(0.0).round(1)
 
         df_this.drop(columns=["month_day", "tave_avg", "tave_real", "prcp_real"], inplace=True)
-        # ====================================================================
 
         # 4. 上部グラフ用の9日間予報を抽出
         f_start_date = today - pd.Timedelta(days=1)
@@ -176,7 +188,7 @@ def get_climate_data():
                 
             df_forecast = df_fb.drop(columns=["month_day", "tave_avg"], errors='ignore')
 
-        # 5. 積算範囲 (CT1) の計算【強固な日付比較】
+        # 5. 積算範囲 (CT1) の計算
         mask_ct = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
         df_ct1 = df_this.loc[mask_ct].copy().reset_index(drop=True)
 
@@ -188,4 +200,55 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
 
-            df_ct1["abs_diff"] = (df_ct1["
+            df_ct1["abs_diff"] = (df_ct1["cum_ct"] - gdd1_target).abs()
+            row_close = df_ct1.loc[df_ct1["abs_diff"].idxmin()]
+            closest_dict = {
+                "date": row_close["date"].strftime("%Y-%m-%d"),
+                "cum_ct": round(row_close["cum_ct"], 1)
+            }
+
+            df_ct1["corrected_cum_ct"] = df_ct1["cum_ct"] + hosei
+            df_ct1["abs_diff_corr"] = (df_ct1["corrected_cum_ct"] - gdd1_target).abs()
+            row_corr = df_ct1.loc[df_ct1["abs_diff_corr"].idxmin()]
+            corrected_dict = {
+                "date": row_corr["date"].strftime("%Y-%m-%d"),
+                "cum_ct": round(row_corr["corrected_cum_ct"], 1)
+            }
+
+            mask_hist = df_ct1["date"] <= yesterday
+            if mask_hist.any():
+                row_hist = df_ct1.loc[mask_hist].iloc[-1]
+                hist_dict = {
+                    "cum_ct": round(row_hist["cum_ct"], 1),
+                    "cum_pr": round(row_hist["cum_pr"], 1)
+                }
+            else:
+                hist_dict = {}
+
+        # 6. JSONデータのクリーンアップ
+        def replace_nan(d):
+            if isinstance(d, list): return [replace_nan(x) for x in d]
+            if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
+            if isinstance(d, float) and math.isnan(d): return None
+            return d
+
+        df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
+        df_forecast["date"] = df_forecast["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].dt.strftime("%Y-%m-%d")
+
+        return jsonify({
+            "average": replace_nan(df_avg.to_dict(orient="records")),
+            "this_year": replace_nan(df_this.to_dict(orient="records")),
+            "forecast": replace_nan(df_forecast.to_dict(orient="records")),
+            "ct1": replace_nan(df_ct1.to_dict(orient="records")),
+            "gdd1_target": closest_dict,
+            "gdd1_target_corr": corrected_dict,
+            "ct1_until_yesterday": hist_dict
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
