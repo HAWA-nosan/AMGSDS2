@@ -10,7 +10,7 @@ import AMD_Tools4 as amd
 app = Flask(__name__)
 
 # ====================================================================
-# ★ 爆速化＆堅牢化の要（気温と降水量を独立して安全に取得）
+# ★ 爆速化＆堅牢化の要
 # ====================================================================
 def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
@@ -24,14 +24,11 @@ def fetch_met_data(element, start_str, end_str, lat, lon):
 
 @lru_cache(maxsize=128)
 def get_cached_avg_data(year, lat, lon):
-    """過去3年の平年値は「気温」だけを計算する（雨量の平年値はノイズになるため不要！）"""
     start_str = f"{year}-04-01"
     end_str = f"{year+1}-03-31"
-    
     df_t = fetch_met_data("TMP_mea", start_str, end_str, lat, lon)
     if df_t.empty:
         return None
-        
     df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
     return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
 
@@ -42,7 +39,6 @@ def get_cached_past_year(py_start, py_end, lat, lon):
     
     if df_t.empty and df_p.empty:
         return None
-        
     if not df_t.empty and not df_p.empty:
         df = df_t.merge(df_p, on="date", how="outer")
     else:
@@ -66,7 +62,6 @@ def get_climate_data():
         ct1_start_str = d.get("ct1_start")
         ct1_end_str = d.get("ct1_end")
 
-        # 単一積算か2段階積算かを自動判定
         is_double = "ct2_start" in d
         if is_double:
             threshold2 = float(d.get("threshold2", threshold1))
@@ -94,7 +89,6 @@ def get_climate_data():
         if all_years_data:
             df_concat = pd.concat(all_years_data)
             df_avg = df_concat.groupby("month_day", as_index=False).mean()
-            df_avg.rename(columns={"tave_avg": "tave_avg"}, inplace=True)
             df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
             df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
@@ -105,7 +99,6 @@ def get_climate_data():
 
         # 2. 実測値＋予報値の収集
         df_available_list = []
-        
         py_start = f"{current_year-1}-04-01"
         py_end   = f"{current_year}-03-31"
         df_py = get_cached_past_year(py_start, py_end, lat, lon)
@@ -133,16 +126,13 @@ def get_climate_data():
                     start_d = (today + pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
                     f_end_str = forecast_end.strftime("%Y-%m-%d")
                     if pd.to_datetime(start_d) > forecast_end: break
-                    
                     df_f_t = fetch_met_data("TMP_mea", start_d, f_end_str, lat, lon)
                     df_f_p = fetch_met_data("APCPRA", start_d, f_end_str, lat, lon)
-                    
                     if not df_f_t.empty or not df_f_p.empty:
                         if not df_f_t.empty and not df_f_p.empty:
                             df_f = df_f_t.merge(df_f_p, on="date", how="outer")
                         else:
                             df_f = df_f_t if not df_f_t.empty else df_f_p
-                            
                         if "TMP_mea" not in df_f.columns: df_f["TMP_mea"] = np.nan
                         if "APCPRA" not in df_f.columns: df_f["APCPRA"] = np.nan
                         df_f.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
@@ -154,7 +144,7 @@ def get_climate_data():
         else:
             df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        # 3. 365日予測タイムラインの作成
+        # 3. タイムラインの作成（未来の雨量は使わない）
         start_this = pd.to_datetime(f"{target_year}-04-01")
         end_this = pd.to_datetime(f"{target_year + 1}-03-31")
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this)})
@@ -180,12 +170,10 @@ def get_climate_data():
 
         mask_normal = df_this["tag"] == "normal"
         
-        # 気温：未来は平年値で埋める
         df_this["tave_this"] = df_this["tave_real"]
         df_this.loc[mask_normal, "tave_this"] = np.nan 
         df_this["tave_this"] = df_this["tave_this"].fillna(df_this["tave_avg"]).round(1)
         
-        # 雨量：未来は一旦 0.0 にして積算エラーを防ぐ（後で表示用に完全消去します）
         df_this["prcp_this"] = df_this["prcp_real"]
         df_this.loc[mask_normal, "prcp_this"] = 0.0 
         df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
@@ -204,27 +192,7 @@ def get_climate_data():
         else:
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
-        if df_forecast.empty or len(df_forecast) < 9:
-            dates_9 = pd.date_range(start=f_start_date, periods=9)
-            df_fb = pd.DataFrame({"date": dates_9})
-            df_fb["month_day"] = df_fb["date"].dt.strftime("%m-%d")
-            if not df_avg.empty:
-                df_fb = df_fb.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
-                df_fb["tave_this"] = df_fb["tave_avg"].fillna(10.0).round(1)
-            else:
-                df_fb["tave_this"] = 10.0
-            
-            df_fb["prcp_this"] = 0.0
-            
-            if not df_forecast.empty:
-                df_fb = df_fb.merge(df_forecast, on="date", how="left", suffixes=("", "_real"))
-                df_fb["tave_this"] = df_fb["tave_this_real"].fillna(df_fb["tave_this"])
-                df_fb["prcp_this"] = df_fb["prcp_this_real"].fillna(df_fb["prcp_this"])
-                df_fb.drop(columns=["tave_this_real", "prcp_this_real"], inplace=True)
-                
-            df_forecast = df_fb.drop(columns=["month_day", "tave_avg"], errors='ignore')
-
-        # 5. 積算計算 (CT1, CT2)
+        # 5. 積算計算
         def calc_accumulation(df_timeline, start_str, end_str, thresh, target):
             if not start_str or not end_str:
                 return pd.DataFrame(), {}, {}, {}
@@ -244,9 +212,8 @@ def get_climate_data():
             df_ct["cum_pr"] = df_ct["daily_pr"].cumsum().round(1)
             
             # ================================================================
-            # ★ 究極のグラフスッキリ化！
-            # 26日先以降の未来の雨量は「空欄(NaN)」に書き換えることで、
-            # スプレッドシートのグラフ上で赤い棒がピタッと止まり非表示になります。
+            # ★ ここが究極の消去ロジック！
+            # 26日先より未来の雨量・積算雨量は、問答無用で「空欄(NaN)」にする！
             # ================================================================
             mask_future = df_ct["date"] > forecast_end
             df_ct.loc[mask_future, "daily_pr"] = np.nan
@@ -290,11 +257,12 @@ def get_climate_data():
         if is_double:
             df_ct2, closest_dict2, _, hist_dict2 = calc_accumulation(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
 
-        # 6. JSONデータのクリーンアップ
+        # 6. JSONデータのクリーンアップ（NaNを確実に空文字へ変換）
         def replace_nan(d):
             if isinstance(d, list): return [replace_nan(x) for x in d]
             if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
-            if isinstance(d, float) and math.isnan(d): return None # NaNはNone(空欄)に変換
+            # pd.isnaを使って、NaNがあれば確実に「""（空の文字列）」に変換してスプレッドシートを空白にする
+            if pd.isna(d): return "" 
             return d
 
         df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
