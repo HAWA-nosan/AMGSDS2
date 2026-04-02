@@ -10,39 +10,43 @@ import AMD_Tools4 as amd
 app = Flask(__name__)
 
 # ====================================================================
-# ★ 爆速化＆堅牢化の要
+# ★ 爆速化＆堅牢化の要（日付変換のエラーを完全に撲滅！）
 # ====================================================================
 def fetch_met_data(element, start_str, end_str, lat, lon):
-    """気温や降水量を個別に取得し、エラー時は空のDataFrameを返す安全な関数"""
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
-        return pd.DataFrame({
-            "date": pd.to_datetime(tim).dt.normalize(),
+        
+        # 修正ポイント：最も安全で確実な日付変換ロジック
+        s_dates = pd.to_datetime(pd.Series(list(tim)))
+        df = pd.DataFrame({
+            "date": s_dates.dt.normalize(),
             element: val[:, 0, 0]
         })
-    except Exception:
+        return df
+    except Exception as e:
+        print(f"API Error ({element}): {e}")
         return pd.DataFrame(columns=["date", element])
 
 @lru_cache(maxsize=128)
 def get_cached_avg_data(year, lat, lon):
     start_str = f"{year}-04-01"
     end_str = f"{year+1}-03-31"
+    
     df_t = fetch_met_data("TMP_mea", start_str, end_str, lat, lon)
     if df_t.empty:
         return None
+        
     df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
-    return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave"})
+    return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
 
 @lru_cache(maxsize=64)
 def get_cached_past_year(py_start, py_end, lat, lon):
-    """過去のデータを気温・降水量それぞれ独立して取得する"""
     df_t = fetch_met_data("TMP_mea", py_start, py_end, lat, lon)
     df_p = fetch_met_data("APCPRA", py_start, py_end, lat, lon)
     
     if df_t.empty and df_p.empty:
         return None
         
-    # 片方だけ成功した場合もガッチャンコして返す
     if not df_t.empty and not df_p.empty:
         df = df_t.merge(df_p, on="date", how="outer")
     else:
@@ -62,13 +66,16 @@ def get_climate_data():
         
         threshold1 = float(d["threshold"])
         gdd1_target = float(d["gdd1"])
+        hosei = float(d.get("hosei", 0.0))
         ct1_start_str = d.get("ct1_start")
         ct1_end_str = d.get("ct1_end")
-        
-        threshold2 = float(d.get("threshold2", threshold1))
-        gdd2_target = float(d.get("gdd2", 0))
-        ct2_start_str = d.get("ct2_start")
-        ct2_end_str = d.get("ct2_end")
+
+        is_double = "ct2_start" in d
+        if is_double:
+            threshold2 = float(d.get("threshold2", threshold1))
+            gdd2_target = float(d.get("gdd2", 0))
+            ct2_start_str = d.get("ct2_start")
+            ct2_end_str = d.get("ct2_end")
         
         today = pd.Timestamp(datetime.utcnow().date())
         yesterday = today - pd.Timedelta(days=1)
@@ -89,8 +96,7 @@ def get_climate_data():
 
         if all_years_data:
             df_concat = pd.concat(all_years_data)
-            df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
-            df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
+            df_avg = df_concat.groupby("month_day", as_index=False).mean()
             df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
             df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
@@ -99,16 +105,14 @@ def get_climate_data():
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # 2. 実測値＋予報値の収集（分離取得で絶対に落とさない）
+        # 2. 実測値＋予報値の収集
         df_available_list = []
-        
         py_start = f"{current_year-1}-04-01"
         py_end   = f"{current_year}-03-31"
         df_py = get_cached_past_year(py_start, py_end, lat, lon)
         if df_py is not None:
             df_available_list.append(df_py.copy())
 
-        # 今年度データ
         cy_start = f"{current_year}-04-01"
         cy_end   = f"{current_year+1}-03-31"
         df_cy_t = fetch_met_data("TMP_mea", cy_start, cy_end, lat, lon)
@@ -121,11 +125,10 @@ def get_climate_data():
                 df_cy = df_cy_t if not df_cy_t.empty else df_cy_p
                 
             if "TMP_mea" not in df_cy.columns: df_cy["TMP_mea"] = np.nan
-            if "APCPRA" not in df_cy.columns: df_cy["APCPRA"] = 0.0
+            if "APCPRA" not in df_cy.columns: df_cy["APCPRA"] = np.nan
             df_cy.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
             df_available_list.append(df_cy)
         else:
-            # 4月上旬バグ用のフォールバック
             if today.month == 4 and today.day <= 7:
                 for offset in [-1, 0, 1, 2, 3]:
                     start_d = (today + pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -142,7 +145,7 @@ def get_climate_data():
                             df_f = df_f_t if not df_f_t.empty else df_f_p
                             
                         if "TMP_mea" not in df_f.columns: df_f["TMP_mea"] = np.nan
-                        if "APCPRA" not in df_f.columns: df_f["APCPRA"] = 0.0
+                        if "APCPRA" not in df_f.columns: df_f["APCPRA"] = np.nan
                         df_f.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
                         df_available_list.append(df_f)
                         break
@@ -152,7 +155,7 @@ def get_climate_data():
         else:
             df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        # 3. 365日予測タイムライン（ハイブリッド）の作成
+        # 3. タイムラインの作成
         start_this = pd.to_datetime(f"{target_year}-04-01")
         end_this = pd.to_datetime(f"{target_year + 1}-03-31")
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this)})
@@ -176,11 +179,16 @@ def get_climate_data():
             df_this["tave_real"] = np.nan
             df_this["prcp_real"] = np.nan
 
-        df_this["tave_this"] = df_this["tave_real"]
         mask_normal = df_this["tag"] == "normal"
+        
+        df_this["tave_this"] = df_this["tave_real"]
         df_this.loc[mask_normal, "tave_this"] = np.nan 
         df_this["tave_this"] = df_this["tave_this"].fillna(df_this["tave_avg"]).round(1)
-        df_this["prcp_this"] = df_this["prcp_real"].fillna(0.0).round(1)
+        
+        df_this["prcp_this"] = df_this["prcp_real"]
+        df_this.loc[mask_normal, "prcp_this"] = 0.0 
+        df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
+        
         df_this.drop(columns=["month_day", "tave_avg", "tave_real", "prcp_real"], inplace=True)
 
         # 4. グラフ用9日間予報抽出
@@ -191,6 +199,7 @@ def get_climate_data():
         if mask_f.any():
             df_forecast = df_available.loc[mask_f].copy().reset_index(drop=True)
             df_forecast.rename(columns={"tave_real": "tave_this", "prcp_real": "prcp_this"}, inplace=True)
+            df_forecast["prcp_this"] = df_forecast["prcp_this"].fillna(0.0)
         else:
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
@@ -217,7 +226,7 @@ def get_climate_data():
         # ====================================================================
         def calc_accumulation(df_timeline, start_str, end_str, thresh, target):
             if not start_str or not end_str:
-                return pd.DataFrame(), {}, {}
+                return pd.DataFrame(), {}, {}, {}
                 
             s_date = pd.to_datetime(start_str)
             e_date = pd.to_datetime(end_str)
@@ -226,12 +235,17 @@ def get_climate_data():
             df_ct = df_timeline.loc[mask].copy().reset_index(drop=True)
             
             if df_ct.empty:
-                return pd.DataFrame(), {}, {}
+                return pd.DataFrame(), {}, {}, {}
                 
             df_ct["daily_ct"] = (df_ct["tave_this"] - thresh).clip(lower=0).round(1)
             df_ct["cum_ct"] = df_ct["daily_ct"].cumsum().round(1)
             df_ct["daily_pr"] = df_ct["prcp_this"].round(1)
             df_ct["cum_pr"] = df_ct["daily_pr"].cumsum().round(1)
+            
+            # 未来の雨量はここで確実に空欄にする
+            mask_future = df_ct["date"] > forecast_end
+            df_ct.loc[mask_future, "daily_pr"] = np.nan
+            df_ct.loc[mask_future, "cum_pr"] = np.nan
             
             df_ct["abs_diff"] = (df_ct["cum_ct"] - target).abs()
             row_close = df_ct.loc[df_ct["abs_diff"].idxmin()]
@@ -239,7 +253,71 @@ def get_climate_data():
                 "date": row_close["date"].strftime("%Y-%m-%d"),
                 "cum_ct": round(row_close["cum_ct"], 1)
             }
-            
+
+            if target > 0:
+                df_ct["corrected_cum_ct"] = df_ct["cum_ct"] + hosei
+                df_ct["abs_diff_corr"] = (df_ct["corrected_cum_ct"] - target).abs()
+                row_corr = df_ct.loc[df_ct["abs_diff_corr"].idxmin()]
+                corrected_dict = {
+                    "date": row_corr["date"].strftime("%Y-%m-%d"),
+                    "cum_ct": round(row_corr["corrected_cum_ct"], 1)
+                }
+            else:
+                corrected_dict = {}
+                
             mask_hist = df_ct["date"] <= yesterday
             if mask_hist.any():
-                row_hist = df_ct.loc
+                row_hist = df_ct.loc[mask_hist].iloc[-1]
+                hist_dict = {
+                    "cum_ct": round(row_hist["cum_ct"], 1),
+                    "cum_pr": round(row_hist["cum_pr"], 1)
+                }
+            else:
+                hist_dict = {}
+                
+            return df_ct, closest_dict, corrected_dict, hist_dict
+
+        df_ct1, closest_dict1, corrected_dict1, hist_dict1 = calc_accumulation(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
+        
+        df_ct2 = pd.DataFrame()
+        closest_dict2 = {}
+        hist_dict2 = {}
+        if is_double:
+            df_ct2, closest_dict2, _, hist_dict2 = calc_accumulation(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
+
+        # 6. JSONデータのクリーンアップ
+        def replace_nan(d):
+            if isinstance(d, list): return [replace_nan(x) for x in d]
+            if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
+            # NaNは空文字に変換（これでスプレッドシートのセルが確実に空になります）
+            if pd.isna(d): return "" 
+            return d
+
+        df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
+        df_forecast["date"] = df_forecast["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct2.empty: df_ct2["date"] = df_ct2["date"].dt.strftime("%Y-%m-%d")
+
+        res_dict = {
+            "average": replace_nan(df_avg.to_dict(orient="records")),
+            "this_year": replace_nan(df_this.to_dict(orient="records")),
+            "forecast": replace_nan(df_forecast.to_dict(orient="records")),
+            "ct1": replace_nan(df_ct1.to_dict(orient="records")),
+            "gdd1_target": closest_dict1,
+            "gdd1_target_corr": corrected_dict1,
+            "ct1_until_yesterday": hist_dict1,
+        }
+        
+        if is_double:
+            res_dict["ct2"] = replace_nan(df_ct2.to_dict(orient="records"))
+            res_dict["gdd2_target"] = closest_dict2
+            res_dict["ct2_until_yesterday"] = hist_dict2
+
+        return jsonify(res_dict)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
