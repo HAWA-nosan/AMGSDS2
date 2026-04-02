@@ -10,20 +10,18 @@ import AMD_Tools4 as amd
 app = Flask(__name__)
 
 # ====================================================================
-# ★ 爆速化＆堅牢化の要（日付変換のエラーを完全に修正！）
+# ★ 爆速化＆堅牢化の要（日付変換のエラーを完全に撲滅！）
 # ====================================================================
 def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
         
-        # 日付変換のバグを修正：どんな形式できても確実に変換する
-        dates = pd.to_datetime(tim)
-        dates = dates.normalize() if isinstance(dates, pd.DatetimeIndex) else dates.dt.normalize()
+        # 修正ポイント：最も安全で確実な日付変換ロジックに変更
+        df = pd.DataFrame({element: val[:, 0, 0]})
+        df["date"] = pd.to_datetime(list(tim))
+        df["date"] = df["date"].dt.normalize()
         
-        return pd.DataFrame({
-            "date": dates,
-            element: val[:, 0, 0]
-        })
+        return df[["date", element]]
     except Exception as e:
         print(f"API Error ({element}): {e}")
         return pd.DataFrame(columns=["date", element])
@@ -153,7 +151,7 @@ def get_climate_data():
         else:
             df_available = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
 
-        # 3. タイムラインの作成（未来の雨量は使わない）
+        # 3. タイムラインの作成
         start_this = pd.to_datetime(f"{target_year}-04-01")
         end_this = pd.to_datetime(f"{target_year + 1}-03-31")
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this)})
@@ -220,9 +218,7 @@ def get_climate_data():
             df_ct["daily_pr"] = df_ct["prcp_this"].round(1)
             df_ct["cum_pr"] = df_ct["daily_pr"].cumsum().round(1)
             
-            # ================================================================
-            # ★ 未来の雨量はここで確実に空欄にする
-            # ================================================================
+            # 未来の雨量はここで確実に空欄にする
             mask_future = df_ct["date"] > forecast_end
             df_ct.loc[mask_future, "daily_pr"] = np.nan
             df_ct.loc[mask_future, "cum_pr"] = np.nan
@@ -269,7 +265,6 @@ def get_climate_data():
         def replace_nan(d):
             if isinstance(d, list): return [replace_nan(x) for x in d]
             if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
-            # NaNは空文字に変換（これでスプレッドシートのセルが確実に空になります）
             if pd.isna(d): return "" 
             return d
 
