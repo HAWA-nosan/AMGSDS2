@@ -2,532 +2,244 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, date
 from pathlib import Path
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 import math
-
 import AMD_Tools4 as amd
 
 app = Flask(__name__)
 
-
-# =========================================================
-# 定数
-# =========================================================
 DATE_FMT = "%Y-%m-%d"
 DL_CSV_PATH = Path(__file__).resolve().parent / "sweetcorn_data-DL.csv"
 
-
-# =========================================================
-# 基本ユーティリティ
-# =========================================================
 def to_date(s: str) -> date:
     return datetime.fromisoformat(s).date()
 
-
 def parse_float(value, allow_none=False):
-    """
-    空文字・None を許容する float パーサ
-    """
     if value is None or value == "":
-        if allow_none:
-            return None
+        if allow_none: return None
         raise ValueError("Required numeric field is missing.")
     return float(value)
 
-
 def parse_int(value):
-    if value is None or value == "":
-        raise ValueError("Required integer field is missing.")
+    if value is None or value == "": raise ValueError("Required integer field is missing.")
     return int(float(value))
 
-
 def round_or_none(x, ndigits=1):
-    if x is None:
-        return None
-    if isinstance(x, float) and math.isnan(x):
-        return None
+    if x is None or (isinstance(x, float) and math.isnan(x)): return None
     return round(float(x), ndigits)
 
-
+# ★ NaNやNaTを確実に空文字にする安全なクリーンアップ
 def replace_nan_with_none(data):
-    if isinstance(data, list):
-        return [replace_nan_with_none(x) for x in data]
-    if isinstance(data, dict):
-        return {k: replace_nan_with_none(v) for k, v in data.items()}
-    if isinstance(data, float) and math.isnan(data):
-        return None
+    if isinstance(data, list): return [replace_nan_with_none(x) for x in data]
+    if isinstance(data, dict): return {k: replace_nan_with_none(v) for k, v in data.items()}
+    if pd.isna(data): return ""
     return data
 
-
 def to_iso_or_none(d):
-    if d is None:
-        return None
-    if isinstance(d, (datetime, date)):
-        return d.isoformat()
+    if pd.isna(d): return ""
+    if isinstance(d, (datetime, date)): return d.isoformat()
     return d
 
-
-# =========================================================
-# 入力パラメータ
-# =========================================================
 def parse_request_payload(d: dict) -> dict:
-    """
-    GAS から受け取る JSON を厳密に解釈
-    """
-    params = {
-        "lat": float(d["lat"]),
-        "lon": float(d["lon"]),
-
-        "ct1_start": to_date(d["ct1_start"]),
-        "ct1_end": to_date(d["ct1_end"]),
-        "method1": parse_int(d["method1"]),
-        "base_threshold1": parse_float(d["base_threshold1"]),
+    return {
+        "lat": float(d["lat"]), "lon": float(d["lon"]),
+        "ct1_start": to_date(d["ct1_start"]), "ct1_end": to_date(d["ct1_end"]),
+        "method1": parse_int(d["method1"]), "base_threshold1": parse_float(d["base_threshold1"]),
         "ceiling_threshold1": parse_float(d.get("ceiling_threshold1"), allow_none=True),
         "gdd1_target": parse_float(d["gdd1"]),
-
-        "ct2_start": to_date(d["ct2_start"]),
-        "ct2_end": to_date(d["ct2_end"]),
-        "method2": parse_int(d["method2"]),
-        "base_threshold2": parse_float(d["base_threshold2"]),
+        "ct2_start": to_date(d["ct2_start"]), "ct2_end": to_date(d["ct2_end"]),
+        "method2": parse_int(d["method2"]), "base_threshold2": parse_float(d["base_threshold2"]),
         "ceiling_threshold2": parse_float(d.get("ceiling_threshold2"), allow_none=True),
         "gdd2_target": parse_float(d["gdd2"]),
     }
-    return params
 
-
-# =========================================================
-# 気象データ取得
-# =========================================================
+# ★ 爆速キャッシュ＆日付エラー撲滅ロジック
+@lru_cache(maxsize=256)
 def fetch_point_series(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
-    arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [lat, lat, lon, lon])
-    values = arr[:, 0, 0]
-    dates = pd.to_datetime(tim).map(lambda x: x.date())
-    return dates, values
-
+    try:
+        arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [lat, lat, lon, lon])
+        values = arr[:, 0, 0]
+        s_dates = pd.to_datetime(pd.Series(list(tim)))
+        dates = s_dates.dt.normalize().dt.date.tolist()
+        return dates, list(values)
+    except Exception as e:
+        print(f"API Error ({var_name}): {e}")
+        return [], []
 
 def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years: int = 3) -> pd.DataFrame:
-    """
-    過去 n_years の 4/1〜翌3/31 の TMP_mea から month_day 平年値を作る
-    ★アップデート：エラー回避機能を追加
-    """
     all_years = []
     start_year = fiscal_year - n_years
-
     for year in range(start_year, fiscal_year):
-        start = f"{year}-04-01"
-        end = f"{year + 1}-03-31"
-        try:
-            dates, values = fetch_point_series("TMP_mea", start, end, lat, lon)
-            df = pd.DataFrame({
-                "datetime": pd.to_datetime(dates),
-                "tave": values
-            })
+        start, end = f"{year}-04-01", f"{year + 1}-03-31"
+        dates, values = fetch_point_series("TMP_mea", start, end, lat, lon)
+        if dates:
+            df = pd.DataFrame({"datetime": pd.to_datetime(dates), "tave": values})
             df["month_day"] = df["datetime"].dt.strftime("%m-%d")
             all_years.append(df[["month_day", "tave"]])
-        except Exception:
-            pass # 1年分のデータが欠損していても処理を止めない
 
-    if not all_years:
-        return pd.DataFrame(columns=["month_day", "tave_avg"])
-
+    if not all_years: return pd.DataFrame(columns=["month_day", "tave_avg"])
     df_concat = pd.concat(all_years, ignore_index=True)
     df_avg = df_concat.groupby("month_day", as_index=False)["tave"].mean()
     df_avg.rename(columns={"tave": "tave_avg"}, inplace=True)
     df_avg["tave_avg"] = df_avg["tave_avg"].round(1)
 
-    # 4/1 始まりに並べ替え
     df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
     df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
-    start_idx = df_avg.index[df_avg["month_day"] == "04-01"][0]
-    df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]], ignore_index=True)
-    df_avg = df_avg.drop(columns="sort_key")
-
+    idx_m = df_avg.index[df_avg["month_day"] == "04-01"]
+    start_idx = idx_m[0] if len(idx_m) > 0 else 0
+    df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]], ignore_index=True).drop(columns="sort_key")
     return df_avg
 
-
 def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: date, df_avg: pd.DataFrame) -> pd.DataFrame:
-    """
-    今年度の実測値＋予報/平年補完用データを作る
-    ★アップデート：エラー回避機能を追加
-    """
-    start_this = f"{fiscal_year}-04-01"
-    end_this = f"{fiscal_year + 1}-03-31"
+    start_this, end_this = f"{fiscal_year}-04-01", f"{fiscal_year + 1}-03-31"
+    dates, tmean = fetch_point_series("TMP_mea", start_this, end_this, lat, lon)
+    _, tmax = fetch_point_series("TMP_max", start_this, end_this, lat, lon)
+    _, tmin = fetch_point_series("TMP_min", start_this, end_this, lat, lon)
+    _, prcp = fetch_point_series("APCPRA", start_this, end_this, lat, lon)
 
-    try:
-        dates, tmean = fetch_point_series("TMP_mea", start_this, end_this, lat, lon)
-        _, tmax = fetch_point_series("TMP_max", start_this, end_this, lat, lon)
-        _, tmin = fetch_point_series("TMP_min", start_this, end_this, lat, lon)
-        _, prcp = fetch_point_series("APCPRA", start_this, end_this, lat, lon)
-
-        df = pd.DataFrame({
-            "date": dates,
-            "tave_this": tmean,
-            "tmax_this": tmax,
-            "tmin_this": tmin,
-            "prcp_this": prcp
-        })
-    except Exception:
-        # 気象データが全く取得できなかった場合の安全用空データフレーム
+    if not dates:
         df = pd.DataFrame(columns=["date", "tave_this", "tmax_this", "tmin_this", "prcp_this"])
+    else:
+        df = pd.DataFrame({"date": dates, "tave_this": tmean, "tmax_this": tmax, "tmin_this": tmin, "prcp_this": prcp})
 
     if df.empty:
         df["tag"] = []
         return df
 
-    yesterday = today - timedelta(days=1)
-    forecast_end = today + timedelta(days=26)
-
-    def assign_tag(d):
-        if d <= yesterday:
-            return "past"
-        elif d <= forecast_end:
-            return "forecast"
-        else:
-            return "normal"
-
-    df["tag"] = df["date"].map(assign_tag)
+    yesterday, forecast_end = today - timedelta(days=1), today + timedelta(days=26)
+    df["tag"] = df["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
 
     if not df_avg.empty:
-        # 平年値 merge
-        df["month_day"] = df["date"].map(lambda d: d.strftime("%m-%d"))
+        df["month_day"] = pd.to_datetime(df["date"]).dt.strftime("%m-%d")
         df = df.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
-
-        # normal 部分だけ 平年値で tave を置換
         normal_mask = df["tag"] == "normal"
         df.loc[normal_mask, "tave_this"] = df.loc[normal_mask, "tave_avg"]
         df.drop(columns=["month_day", "tave_avg"], inplace=True)
-    
     return df
 
-
-# =========================================================
-# 日長CSV
-# =========================================================
 def load_daylength_table(csv_path: Path = DL_CSV_PATH) -> pd.DataFrame:
-    """
-    sweetcorn_data-DL.csv を読み込む
-    """
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Daylength CSV not found: {csv_path}")
-
+    if not csv_path.exists(): raise FileNotFoundError(f"Daylength CSV not found: {csv_path}")
     df_dl = pd.read_csv(csv_path)
-
-    required_cols = {"date", "DL"}
-    if not required_cols.issubset(df_dl.columns):
-        raise ValueError(f"Daylength CSV must contain columns: {required_cols}")
-
-    df_dl = df_dl.copy()
     df_dl["month_day"] = df_dl["date"].astype(str).str.strip()
     df_dl["DL"] = pd.to_numeric(df_dl["DL"], errors="coerce")
-
-    if df_dl["DL"].isna().any():
-        bad_rows = df_dl[df_dl["DL"].isna()]
-        raise ValueError(f"Invalid DL values found in daylength CSV: {bad_rows.to_dict(orient='records')}")
-
-    # 念のため重複除去
-    df_dl = df_dl.drop_duplicates(subset=["month_day"]).reset_index(drop=True)
-
-    return df_dl[["month_day", "DL"]]
-
+    return df_dl.drop_duplicates(subset=["month_day"]).reset_index(drop=True)[["month_day", "DL"]]
 
 def add_daylength_from_csv(df: pd.DataFrame, df_dl_master: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         out = df.copy()
         out["DL_hours"] = pd.Series(dtype=float)
         return out
-
     out = df.copy()
-    out["month_day"] = out["date"].map(lambda d: f"{d.month}/{d.day}")
+    out["month_day"] = pd.to_datetime(out["date"]).dt.strftime("%-m/%-d")
     out = out.merge(df_dl_master, on="month_day", how="left")
-
-    if out["DL"].isna().any():
-        missing = out.loc[out["DL"].isna(), "month_day"].drop_duplicates().tolist()
-        raise ValueError(f"Missing daylength data for month/day: {missing}")
-
     out["DL_hours"] = out["DL"].astype(float)
-    out = out.drop(columns=["month_day", "DL"])
-    return out
+    return out.drop(columns=["month_day", "DL"])
 
-
-# =========================================================
-# GDD 計算
-# =========================================================
 def validate_method_and_thresholds(method: int, t_base: float, t_ceiling):
-    if method not in range(1, 9):
-        raise ValueError(f"Unsupported method: {method}. method must be 1-8.")
-
-    if method in [3, 4, 7, 8] and t_ceiling is None:
-        raise ValueError(f"Method {method} requires ceiling_threshold.")
-
-    if t_ceiling is not None and t_ceiling < t_base:
-        raise ValueError("ceiling_threshold must be >= base_threshold.")
-
+    if method not in range(1, 9): raise ValueError(f"Unsupported method: {method}")
+    if method in [3, 4, 7, 8] and t_ceiling is None: raise ValueError(f"Method {method} requires ceiling_threshold.")
+    if t_ceiling is not None and t_ceiling < t_base: raise ValueError("ceiling_threshold must be >= base_threshold.")
 
 def calc_daily_gdd_core(tmean, tmax, method, t_base, t_ceiling=None):
-    if method == 1:
-        return max(0.0, tmean - t_base)
-
-    if method == 2:
-        return max(0.0, tmax - t_base)
-
+    if method == 1: return max(0.0, tmean - t_base)
+    if method == 2: return max(0.0, tmax - t_base)
     if method == 3:
-        if tmax <= t_base:
-            return 0.0
-        if tmax <= t_ceiling:
-            val = tmax - t_base
-        else:
-            val = (2 * t_ceiling - tmax) - t_base
+        if tmax <= t_base: return 0.0
+        val = tmax - t_base if tmax <= t_ceiling else (2 * t_ceiling - tmax) - t_base
         return max(0.0, val)
-
     if method == 4:
-        if tmean <= t_base:
-            return 0.0
-        if tmax <= t_ceiling:
-            val = tmean - t_base
-        else:
-            val = (tmean - (tmax - t_ceiling)) - t_base
+        if tmean <= t_base: return 0.0
+        val = tmean - t_base if tmax <= t_ceiling else (tmean - (tmax - t_ceiling)) - t_base
         return max(0.0, val)
-
-    raise ValueError(f"Unsupported core method: {method}")
-
+    return 0.0
 
 def calc_daily_gdd(row, method, t_base, t_ceiling=None):
-    if method in [1, 2, 3, 4]:
-        return calc_daily_gdd_core(
-            tmean=row["tave_this"],
-            tmax=row["tmax_this"],
-            method=method,
-            t_base=t_base,
-            t_ceiling=t_ceiling
-        )
+    if method in [1, 2, 3, 4]: return calc_daily_gdd_core(row["tave_this"], row["tmax_this"], method, t_base, t_ceiling)
+    core = calc_daily_gdd_core(row["tave_this"], row["tmax_this"], method - 4, t_base, t_ceiling)
+    return core * row["DL_hours"]
 
-    core_method = method - 4
-    core = calc_daily_gdd_core(
-        tmean=row["tave_this"],
-        tmax=row["tmax_this"],
-        method=core_method,
-        t_base=t_base,
-        t_ceiling=t_ceiling
-    )
-    dl = row["DL_hours"]
-    return core * dl
-
-
-def build_accumulation_dataframe(
-    df_src: pd.DataFrame,
-    start_date: date,
-    end_date: date,
-    method: int,
-    t_base: float,
-    t_ceiling,
-    target_gdd: float,
-    df_dl_master: pd.DataFrame
-):
+def build_accumulation_dataframe(df_src: pd.DataFrame, start_date: date, end_date: date, method: int, t_base: float, t_ceiling, target_gdd: float, df_dl_master: pd.DataFrame):
     validate_method_and_thresholds(method, t_base, t_ceiling)
-
-    # df_srcが空の場合は安全に空の辞書を返す
-    if df_src.empty:
-        return df_src.copy(), {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
+    if df_src.empty: return df_src.copy(), {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
 
     mask = (df_src["date"] >= start_date) & (df_src["date"] <= end_date)
     df = df_src.loc[mask].copy().reset_index(drop=True)
+    if df.empty: return df, {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
 
-    if df.empty:
-        return df, {
-            "date": None,
-            "cum_ct": None,
-            "daily_ct": None,
-            "abs_diff": None
-        }
-
-    if method in [5, 6, 7, 8]:
-        df = add_daylength_from_csv(df, df_dl_master)
-    else:
-        df["DL_hours"] = np.nan
-
-    df["daily_ct"] = df.apply(
-        lambda row: calc_daily_gdd(row, method, t_base, t_ceiling),
-        axis=1
-    )
-    df["daily_ct"] = df["daily_ct"].round(1)
+    df = add_daylength_from_csv(df, df_dl_master) if method in [5, 6, 7, 8] else df.assign(DL_hours=np.nan)
+    df["daily_ct"] = df.apply(lambda row: calc_daily_gdd(row, method, t_base, t_ceiling), axis=1).round(1)
     df["cum_ct"] = df["daily_ct"].cumsum().round(1)
 
     df["daily_pr"] = df["prcp_this"].round(1)
     df["cum_pr"] = df["daily_pr"].cumsum().round(1)
+    
+    # ★ 未来の雨量は確実に空欄にする
+    forecast_end_date = datetime.utcnow().date() + timedelta(days=26)
+    mask_future = df["date"] > forecast_end_date
+    df.loc[mask_future, "daily_pr"] = np.nan
+    df.loc[mask_future, "cum_pr"] = np.nan
 
     df["abs_diff"] = (df["cum_ct"] - target_gdd).abs().round(1)
-    idx = df["abs_diff"].idxmin()
-    row_close = df.loc[idx]
-
-    closest = {
-        "date": row_close["date"].isoformat(),
-        "cum_ct": round_or_none(row_close["cum_ct"], 1),
-        "daily_ct": round_or_none(row_close["daily_ct"], 1),
-        "abs_diff": round_or_none(row_close["abs_diff"], 1),
+    row_close = df.loc[df["abs_diff"].idxmin()]
+    return df, {
+        "date": row_close["date"].isoformat(), "cum_ct": round_or_none(row_close["cum_ct"], 1),
+        "daily_ct": round_or_none(row_close["daily_ct"], 1), "abs_diff": round_or_none(row_close["abs_diff"], 1)
     }
-    return df, closest
 
-
-# =========================================================
-# 履歴集計
-# =========================================================
 def make_hist_dict_simple_ct(date_start: date, date_end: date, df_src: pd.DataFrame):
-    if df_src.empty or date_end < date_start:
-        return {"date": None, "cum_ct": None, "cum_pr": None}
-
+    if df_src.empty or date_end < date_start: return {"date": None, "cum_ct": None, "cum_pr": None}
     mask = (df_src["date"] >= date_start) & (df_src["date"] <= date_end)
-    if not mask.any():
-        return {"date": None, "cum_ct": None, "cum_pr": None}
-
+    if not mask.any(): return {"date": None, "cum_ct": None, "cum_pr": None}
     tmp = df_src.loc[mask].copy()
     tmp["daily_ct"] = tmp["tave_this"].clip(lower=0)
+    return {"date": date_end.isoformat(), "cum_ct": round_or_none(tmp["daily_ct"].sum(), 1), "cum_pr": round_or_none(tmp["prcp_this"].sum(), 1)}
 
-    return {
-        "date": date_end.isoformat(),
-        "cum_ct": round_or_none(tmp["daily_ct"].sum(), 1),
-        "cum_pr": round_or_none(tmp["prcp_this"].sum(), 1),
-    }
-
-
-# =========================================================
-# JSON 返却整形
-# =========================================================
 def dataframe_to_records_with_iso_date(df: pd.DataFrame):
     out = df.copy()
-    if "date" in out.columns:
-        out["date"] = out["date"].map(to_iso_or_none)
+    if "date" in out.columns: out["date"] = out["date"].map(to_iso_or_none)
     return replace_nan_with_none(out.to_dict(orient="records"))
 
-
-# =========================================================
-# API
-# =========================================================
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
     try:
         d = request.get_json()
         params = parse_request_payload(d)
-
-        lat = params["lat"]
-        lon = params["lon"]
-
         today = datetime.utcnow().date()
-        
-        # ★アップデート1＆2：平年値(現実の年基準) と 対象年(スプレッドシートの年基準) の分離
         fiscal_year_for_avg = today.year if today.month >= 4 else today.year - 1
-        
-        ct1_start = params["ct1_start"]
-        target_fiscal_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
+        target_fiscal_year = params["ct1_start"].year if params["ct1_start"].month >= 4 else params["ct1_start"].year - 1
+        yesterday, forecast_end = today - timedelta(days=1), today + timedelta(days=26)
 
-        yesterday = today - timedelta(days=1)
-        forecast_end = today + timedelta(days=26)
+        try: df_dl_master = load_daylength_table()
+        except Exception: df_dl_master = pd.DataFrame(columns=["month_day", "DL"])
 
-        # 0. 日長マスタ
-        try:
-            df_dl_master = load_daylength_table()
-        except Exception:
-            # 万が一CSVが無かった場合の安全措置
-            df_dl_master = pd.DataFrame(columns=["month_day", "DL"])
+        df_avg = build_average_temperature(params["lat"], params["lon"], fiscal_year_for_avg, n_years=3)
+        df_this = build_this_year_dataframe(params["lat"], params["lon"], target_fiscal_year, today, df_avg)
+        df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True) if not df_this.empty else pd.DataFrame()
 
-        # 1. 平年値 (現実基準)
-        df_avg = build_average_temperature(lat, lon, fiscal_year_for_avg, n_years=3)
+        df_ct1, closest1 = build_accumulation_dataframe(df_this, params["ct1_start"], params["ct1_end"], params["method1"], params["base_threshold1"], params["ceiling_threshold1"], params["gdd1_target"], df_dl_master)
+        df_ct2, closest2 = build_accumulation_dataframe(df_this, params["ct2_start"], params["ct2_end"], params["method2"], params["base_threshold2"], params["ceiling_threshold2"], params["gdd2_target"], df_dl_master)
 
-        # 2. 今年度データ (スプレッドシートの入力年基準)
-        df_this = build_this_year_dataframe(lat, lon, target_fiscal_year, today, df_avg)
-
-        # 3. 予報部
-        if not df_this.empty:
-            df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
-        else:
-            df_forecast = pd.DataFrame()
-
-        # 4. ct1（絹糸発生日予測用）
-        df_ct1, closest1 = build_accumulation_dataframe(
-            df_src=df_this,
-            start_date=params["ct1_start"],
-            end_date=params["ct1_end"],
-            method=params["method1"],
-            t_base=params["base_threshold1"],
-            t_ceiling=params["ceiling_threshold1"],
-            target_gdd=params["gdd1_target"],
-            df_dl_master=df_dl_master
-        )
-
-        # 5. ct2（収穫日予測用）
-        df_ct2, closest2 = build_accumulation_dataframe(
-            df_src=df_this,
-            start_date=params["ct2_start"],
-            end_date=params["ct2_end"],
-            method=params["method2"],
-            t_base=params["base_threshold2"],
-            t_ceiling=params["ceiling_threshold2"],
-            target_gdd=params["gdd2_target"],
-            df_dl_master=df_dl_master
-        )
-
-        # 6. 履歴値（開発概要どおり単純積算）
         hist_dict1 = make_hist_dict_simple_ct(params["ct1_start"], yesterday, df_this)
-
-        if closest1["date"] is not None:
-            hist_start2 = to_date(closest1["date"])
-        else:
-            hist_start2 = params["ct2_start"]
-
+        hist_start2 = to_date(closest1["date"]) if closest1["date"] is not None else params["ct2_start"]
         hist_dict2 = make_hist_dict_simple_ct(hist_start2, yesterday, df_this)
 
-        # 7. JSON 整形
-        df_this_json = df_this.copy()
-        df_forecast_json = df_forecast.copy()
+        df_this_json, df_forecast_json = df_this.copy(), df_forecast.copy()
+        if not df_this_json.empty: df_this_json["date"] = df_this_json["date"].map(to_iso_or_none)
+        if not df_forecast_json.empty: df_forecast_json["date"] = df_forecast_json["date"].map(to_iso_or_none)
 
-        if not df_this_json.empty:
-            df_this_json["date"] = df_this_json["date"].map(to_iso_or_none)
-        if not df_forecast_json.empty:
-            df_forecast_json["date"] = df_forecast_json["date"].map(to_iso_or_none)
-            
-        df_avg_json = replace_nan_with_none(df_avg.to_dict(orient="records"))
-        
-        # DataFrameのフィルタリングもdf_thisが空の場合は空DFを返す
-        if not df_this.empty:
-            ct1_period_df = df_this.loc[(df_this["date"] >= params["ct1_start"]) & (df_this["date"] <= params["ct1_end"])].reset_index(drop=True)
-            ct2_period_df = df_this.loc[(df_this["date"] >= params["ct2_start"]) & (df_this["date"] <= params["ct2_end"])].reset_index(drop=True)
-        else:
-            ct1_period_df = pd.DataFrame()
-            ct2_period_df = pd.DataFrame()
+        ct1_period_df = df_this.loc[(df_this["date"] >= params["ct1_start"]) & (df_this["date"] <= params["ct1_end"])].reset_index(drop=True) if not df_this.empty else pd.DataFrame()
+        ct2_period_df = df_this.loc[(df_this["date"] >= params["ct2_start"]) & (df_this["date"] <= params["ct2_end"])].reset_index(drop=True) if not df_this.empty else pd.DataFrame()
 
-        return jsonify({
-            "average": df_avg_json,
-            "this_year": replace_nan_with_none(df_this_json.to_dict(orient="records")),
-            "forecast": replace_nan_with_none(df_forecast_json.to_dict(orient="records")),
-
-            "ct1_period": dataframe_to_records_with_iso_date(ct1_period_df),
-            "ct1": dataframe_to_records_with_iso_date(df_ct1),
-            "gdd1_target": replace_nan_with_none(closest1),
-
-            "ct2_period": dataframe_to_records_with_iso_date(ct2_period_df),
-            "ct2": dataframe_to_records_with_iso_date(df_ct2),
-            "gdd2_target": replace_nan_with_none(closest2),
-
-            "ct1_until_yesterday": replace_nan_with_none(hist_dict1),
-            "ct2_until_yesterday": replace_nan_with_none(hist_dict2),
-
-            "meta": {
-                "today_utc": today.isoformat(),
-                "yesterday_utc": yesterday.isoformat(),
-                "forecast_end_utc": forecast_end.isoformat(),
-                "fiscal_year_avg": fiscal_year_for_avg,     # 追記：計算基準となった平年値の年度
-                "fiscal_year_target": target_fiscal_year,   # 追記：計算基準となった実測値の年度
-                "daylength_csv": str(DL_CSV_PATH.name)
-            }
-        })
-
+        return jsonify(replace_nan_with_none({
+            "average": df_avg.to_dict(orient="records"), "this_year": df_this_json.to_dict(orient="records"), "forecast": df_forecast_json.to_dict(orient="records"),
+            "ct1_period": dataframe_to_records_with_iso_date(ct1_period_df), "ct1": dataframe_to_records_with_iso_date(df_ct1), "gdd1_target": closest1,
+            "ct2_period": dataframe_to_records_with_iso_date(ct2_period_df), "ct2": dataframe_to_records_with_iso_date(df_ct2), "gdd2_target": closest2,
+            "ct1_until_yesterday": hist_dict1, "ct2_until_yesterday": hist_dict2
+        }))
     except Exception as e:
-        # 万が一想定外のエラーが起きても、500エラーではなく400として安全にメッセージを返す
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 400
-
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
