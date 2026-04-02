@@ -255,4 +255,49 @@ def get_climate_data():
             else:
                 hist_dict = {}
                 
-            return df_ct, closest_
+            return df_ct, closest_dict, corrected_dict, hist_dict
+
+        df_ct1, closest_dict1, corrected_dict1, hist_dict1 = calc_accumulation(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
+        
+        df_ct2 = pd.DataFrame()
+        closest_dict2 = {}
+        hist_dict2 = {}
+        if is_double:
+            df_ct2, closest_dict2, _, hist_dict2 = calc_accumulation(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
+
+        # 6. JSONデータのクリーンアップ
+        def replace_nan(d):
+            if isinstance(d, list): return [replace_nan(x) for x in d]
+            if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
+            # NaNは空文字に変換（これでスプレッドシートのセルが確実に空になります）
+            if pd.isna(d): return "" 
+            return d
+
+        df_this["date"] = df_this["date"].dt.strftime("%Y-%m-%d")
+        df_forecast["date"] = df_forecast["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].dt.strftime("%Y-%m-%d")
+        if not df_ct2.empty: df_ct2["date"] = df_ct2["date"].dt.strftime("%Y-%m-%d")
+
+        res_dict = {
+            "average": replace_nan(df_avg.to_dict(orient="records")),
+            "this_year": replace_nan(df_this.to_dict(orient="records")),
+            "forecast": replace_nan(df_forecast.to_dict(orient="records")),
+            "ct1": replace_nan(df_ct1.to_dict(orient="records")),
+            "gdd1_target": closest_dict1,
+            "gdd1_target_corr": corrected_dict1,
+            "ct1_until_yesterday": hist_dict1,
+        }
+        
+        if is_double:
+            res_dict["ct2"] = replace_nan(df_ct2.to_dict(orient="records"))
+            res_dict["gdd2_target"] = closest_dict2
+            res_dict["ct2_until_yesterday"] = hist_dict2
+
+        return jsonify(res_dict)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
