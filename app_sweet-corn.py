@@ -4,10 +4,15 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 import pandas as pd
 import numpy as np
-import math
+import traceback
 import AMD_Tools4 as amd
 
 app = Flask(__name__)
+
+# 万が一クラッシュしてもJSONでエラーを返す鉄壁の安全装置
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
 def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
@@ -41,8 +46,9 @@ def get_cached_past_year(py_start, py_end, lat, lon):
 def get_climate_data():
     try:
         d = request.get_json()
-        lat, lon = map(float, (d["lat"], d["lon"]))
-        threshold1, gdd1_target, hosei = float(d["threshold"]), float(d["gdd1"]), float(d.get("hosei", 0.0))
+        lat, lon = float(d["lat"]), float(d["lon"])
+        threshold1, gdd1_target = float(d["threshold"]), float(d["gdd1"])
+        hosei = float(d.get("hosei", 0.0))
         ct1_start_str, ct1_end_str = d.get("ct1_start"), d.get("ct1_end")
         
         is_double = "ct2_start" in d and d["ct2_start"] != ""
@@ -87,8 +93,10 @@ def get_climate_data():
         df_this["tag"] = df_this["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
         df_this["month_day"] = df_this["date"].dt.strftime("%m-%d")
         df_this = df_this.merge(df_avg, on="month_day", how="left").merge(df_available, on="date", how="left")
-        df_this["tave_this"] = np.where(df_this["tag"] == "normal", df_this["tave_avg"], df_this["tave_real"]).astype(float).fillna(df_this["tave_avg"]).round(1)
-        df_this["prcp_this"] = np.where(df_this["tag"] == "normal", 0.0, df_this["prcp_real"]).astype(float).fillna(0.0).round(1)
+        df_this["tave_this"] = np.where(df_this["tag"] == "normal", df_this["tave_avg"], df_this["tave_real"]).astype(float)
+        df_this["tave_this"] = pd.Series(df_this["tave_this"]).fillna(df_this["tave_avg"]).round(1)
+        df_this["prcp_this"] = np.where(df_this["tag"] == "normal", 0.0, df_this["prcp_real"]).astype(float)
+        df_this["prcp_this"] = pd.Series(df_this["prcp_this"]).fillna(0.0).round(1)
 
         mask_f = (df_this["date"] >= (today - pd.Timedelta(days=1))) & (df_this["date"] <= (today + pd.Timedelta(days=7)))
         df_forecast = df_this.loc[mask_f].copy() if mask_f.any() else pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
@@ -101,17 +109,25 @@ def get_climate_data():
             df_ct["daily_ct"] = (df_ct["tave_this"] - thresh).clip(lower=0).round(1)
             df_ct["cum_ct"], df_ct["cum_pr"] = df_ct["daily_ct"].cumsum().round(1), df_ct["prcp_this"].cumsum().round(1)
             
-            # ★ 未来の雨量は完全に消す
+            # 未来の雨量は完全に消す
             mask_fut = df_ct["date"] > forecast_end
             df_ct.loc[mask_fut, ["daily_pr", "cum_pr"]] = np.nan
             
-            row_cl = df_ct.loc[(df_ct["cum_ct"] - target).abs().idxmin()]
-            cl_dict = {"date": row_cl["date"].strftime("%Y-%m-%d"), "cum_ct": round(row_cl["cum_ct"], 1)}
+            try:
+                row_cl = df_ct.loc[(df_ct["cum_ct"] - target).abs().idxmin()]
+                cl_dict = {"date": row_cl["date"].strftime("%Y-%m-%d"), "cum_ct": round(row_cl["cum_ct"], 1)}
+            except Exception:
+                cl_dict = {}
+                
             corr_dict = {}
             if target > 0:
-                df_ct["c_cum"] = df_ct["cum_ct"] + hosei
-                row_co = df_ct.loc[(df_ct["c_cum"] - target).abs().idxmin()]
-                corr_dict = {"date": row_co["date"].strftime("%Y-%m-%d"), "cum_ct": round(row_co["c_cum"], 1)}
+                try:
+                    df_ct["c_cum"] = df_ct["cum_ct"] + hosei
+                    row_co = df_ct.loc[(df_ct["c_cum"] - target).abs().idxmin()]
+                    corr_dict = {"date": row_co["date"].strftime("%Y-%m-%d"), "cum_ct": round(row_co["c_cum"], 1)}
+                except Exception:
+                    pass
+                    
             mask_h = df_ct["date"] <= yesterday
             h_dict = {"cum_ct": round(df_ct.loc[mask_h].iloc[-1]["cum_ct"], 1), "cum_pr": round(df_ct.loc[mask_h].iloc[-1]["cum_pr"], 1)} if mask_h.any() else {}
             return df_ct, cl_dict, corr_dict, h_dict
@@ -119,17 +135,23 @@ def get_climate_data():
         df_ct1, cl1, co1, hi1 = calc_acc(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
         res = {"average": df_avg.to_dict(orient="records"), "this_year": df_this.to_dict(orient="records"), "forecast": df_forecast.to_dict(orient="records"),
                "ct1": df_ct1.to_dict(orient="records") if df_ct1 is not None else [], "gdd1_target": cl1, "gdd1_target_corr": co1, "ct1_until_yesterday": hi1}
+        
         if is_double:
             df_ct2, cl2, _, hi2 = calc_acc(df_this, ct2_start_str, ct2_end_str, threshold2, gdd2_target)
             res.update({"ct2": df_ct2.to_dict(orient="records") if df_ct2 is not None else [], "gdd2_target": cl2, "ct2_until_yesterday": hi2})
 
+        # データ変換時のクラッシュを防ぐ絶対安全ロジック
         def clean(obj):
             if isinstance(obj, list): return [clean(x) for x in obj]
             if isinstance(obj, dict): return {k: clean(v) for k, v in obj.items()}
-            return "" if pd.isna(obj) else (obj.strftime("%Y-%m-%d") if isinstance(obj, pd.Timestamp) else obj)
+            if pd.isna(obj): return ""
+            if isinstance(obj, (np.integer, np.floating)): return float(obj) if not np.isnan(obj) else ""
+            if isinstance(obj, (pd.Timestamp, datetime)): return obj.strftime("%Y-%m-%d")
+            return obj
+            
         return jsonify(clean(res))
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"status": "error", "message": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
