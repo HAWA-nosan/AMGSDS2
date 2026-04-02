@@ -16,12 +16,13 @@ def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
         
-        # 修正ポイント：最も安全で確実な日付変換ロジックに変更
-        df = pd.DataFrame({element: val[:, 0, 0]})
-        df["date"] = pd.to_datetime(list(tim))
-        df["date"] = df["date"].dt.normalize()
-        
-        return df[["date", element]]
+        # 修正ポイント：最も安全で確実な日付変換ロジック
+        s_dates = pd.to_datetime(pd.Series(list(tim)))
+        df = pd.DataFrame({
+            "date": s_dates.dt.normalize(),
+            element: val[:, 0, 0]
+        })
+        return df
     except Exception as e:
         print(f"API Error ({element}): {e}")
         return pd.DataFrame(columns=["date", element])
@@ -133,13 +134,16 @@ def get_climate_data():
                     start_d = (today + pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
                     f_end_str = forecast_end.strftime("%Y-%m-%d")
                     if pd.to_datetime(start_d) > forecast_end: break
+                    
                     df_f_t = fetch_met_data("TMP_mea", start_d, f_end_str, lat, lon)
                     df_f_p = fetch_met_data("APCPRA", start_d, f_end_str, lat, lon)
+                    
                     if not df_f_t.empty or not df_f_p.empty:
                         if not df_f_t.empty and not df_f_p.empty:
                             df_f = df_f_t.merge(df_f_p, on="date", how="outer")
                         else:
                             df_f = df_f_t if not df_f_t.empty else df_f_p
+                            
                         if "TMP_mea" not in df_f.columns: df_f["TMP_mea"] = np.nan
                         if "APCPRA" not in df_f.columns: df_f["APCPRA"] = np.nan
                         df_f.rename(columns={"TMP_mea": "tave_real", "APCPRA": "prcp_real"}, inplace=True)
@@ -199,7 +203,27 @@ def get_climate_data():
         else:
             df_forecast = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
+        if df_forecast.empty or len(df_forecast) < 9:
+            dates_9 = pd.date_range(start=f_start_date, periods=9)
+            df_fb = pd.DataFrame({"date": dates_9, "prcp_this": 0.0})
+            df_fb["month_day"] = df_fb["date"].dt.strftime("%m-%d")
+            if not df_avg.empty:
+                df_fb = df_fb.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
+                df_fb["tave_this"] = df_fb["tave_avg"].fillna(10.0).round(1)
+            else:
+                df_fb["tave_this"] = 10.0
+            
+            if not df_forecast.empty:
+                df_fb = df_fb.merge(df_forecast, on="date", how="left", suffixes=("", "_real"))
+                df_fb["tave_this"] = df_fb["tave_this_real"].fillna(df_fb["tave_this"])
+                df_fb["prcp_this"] = df_fb["prcp_this_real"].fillna(df_fb["prcp_this"])
+                df_fb.drop(columns=["tave_this_real", "prcp_this_real"], inplace=True)
+                
+            df_forecast = df_fb.drop(columns=["month_day", "tave_avg"], errors='ignore')
+
+        # ====================================================================
         # 5. 積算計算
+        # ====================================================================
         def calc_accumulation(df_timeline, start_str, end_str, thresh, target):
             if not start_str or not end_str:
                 return pd.DataFrame(), {}, {}, {}
@@ -265,6 +289,7 @@ def get_climate_data():
         def replace_nan(d):
             if isinstance(d, list): return [replace_nan(x) for x in d]
             if isinstance(d, dict): return {k: replace_nan(v) for k, v in d.items()}
+            # NaNは空文字に変換（これでスプレッドシートのセルが確実に空になります）
             if pd.isna(d): return "" 
             return d
 
