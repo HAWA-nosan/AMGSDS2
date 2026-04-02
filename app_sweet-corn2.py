@@ -5,6 +5,7 @@ from pathlib import Path
 from functools import lru_cache
 import pandas as pd
 import numpy as np
+import math      # ★ここが抜けていました！大変失礼いたしました！
 import traceback
 
 try:
