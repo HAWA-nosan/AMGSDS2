@@ -33,8 +33,11 @@ def get_climate_data():
             try:
                 temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
                 flat_temp = temp[:, 0, 0]
+                
+                # ★日付変換エラーの回避
+                s_dates = pd.to_datetime(pd.Series(list(tim)))
                 df = pd.DataFrame({
-                    "datetime": pd.to_datetime(tim),
+                    "datetime": s_dates,
                     "tave": flat_temp
                 })
                 df["month_day"] = df["datetime"].dt.strftime("%m-%d")
@@ -61,8 +64,11 @@ def get_climate_data():
         try:
             temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [start_this, end_this], [lat, lat, lon, lon])
             prcp_this, *_ = amd.GetMetData("APCPRA",  [start_this, end_this], [lat, lat, lon, lon])
+            
+            # ★日付変換エラーの回避
+            s_this_dates = pd.to_datetime(pd.Series(list(tim_this)))
             df_this = pd.DataFrame({
-                "date"      : pd.to_datetime(tim_this).map(lambda dt: dt.date()),
+                "date"      : s_this_dates.dt.date,
                 "tave_this" : temp_this[:, 0, 0],
                 "prcp_this" : prcp_this[:, 0, 0]       
             })    
@@ -82,7 +88,7 @@ def get_climate_data():
             df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
             
             if not df_avg.empty:
-                df_this["month_day"] = df_this["date"].map(lambda dt: dt.strftime("%m-%d"))
+                df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
                 df_this = df_this.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
                 mask = df_this["tag"] == "normal"
                 df_this.loc[mask, "tave_this"] = df_this.loc[mask, "tave_avg"]
@@ -107,7 +113,7 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
 
-            # ★ 唯一の修正点：未来の雨量を空欄にする
+            # ★ 未来の雨量を空欄にする
             mask_fut = df_ct1["date"] > forecast_end
             df_ct1.loc[mask_fut, "daily_pr"] = np.nan
             df_ct1.loc[mask_fut, "cum_pr"] = np.nan
