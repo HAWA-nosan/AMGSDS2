@@ -5,8 +5,12 @@ from functools import lru_cache
 import pandas as pd
 import numpy as np
 import traceback
+import math
 
-import AMD_Tools4 as amd
+try:
+    import AMD_Tools4 as amd
+except ImportError:
+    amd = None
 
 app = Flask(__name__)
 
@@ -17,9 +21,8 @@ def handle_exception(e):
 def fetch_met_data(element, start_str, end_str, lat, lon):
     try:
         val, tim, *_ = amd.GetMetData(element, [start_str, end_str], [lat, lat, lon, lon])
-        dates = pd.to_datetime(tim)
-        dates = dates.normalize() if hasattr(dates, "normalize") else dates.dt.normalize()
-        return pd.DataFrame({"date": dates.dt.date, element: val[:, 0, 0]})
+        dates = pd.to_datetime(pd.Series(list(tim)))
+        return pd.DataFrame({"date": dates.dt.normalize(), element: val[:, 0, 0]})
     except Exception:
         return pd.DataFrame(columns=["date", element])
 
@@ -27,7 +30,7 @@ def fetch_met_data(element, start_str, end_str, lat, lon):
 def get_cached_avg_data(year, lat, lon):
     df_t = fetch_met_data("TMP_mea", f"{year}-04-01", f"{year+1}-03-31", lat, lon)
     if df_t.empty: return None
-    df_t["month_day"] = pd.to_datetime(df_t["date"]).dt.strftime("%m-%d")
+    df_t["month_day"] = df_t["date"].dt.strftime("%m-%d")
     return df_t[["month_day", "TMP_mea"]].rename(columns={"TMP_mea": "tave_avg"})
 
 @lru_cache(maxsize=64)
@@ -57,8 +60,12 @@ def get_climate_data():
         current_year = today.year if today.month >= 4 else today.year - 1
         target_year = ct1_start_ts.year if ct1_start_ts.month >= 4 else ct1_start_ts.year - 1
 
-        # API制限を回避するため、安全な1年ごとのループ取得に戻しました
-        all_years_data = [res for y in range(current_year - 3, current_year) if (res := get_cached_avg_data(y, lat, lon)) is not None]
+        # 【元に戻した部分】1年ずつ順番に取得する安定版ループ
+        all_years_data = []
+        for year in range(current_year - 3, current_year):
+            res = get_cached_avg_data(year, lat, lon)
+            if res is not None:
+                all_years_data.append(res.copy())
 
         if all_years_data:
             df_avg = pd.concat(all_years_data).groupby("month_day", as_index=False).mean()
@@ -86,9 +93,9 @@ def get_climate_data():
 
         df_available = pd.concat(df_available_list).drop_duplicates(subset=["date"], keep="last") if df_available_list else pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
         
-        df_this = pd.DataFrame({"date": pd.date_range(start=f"{target_year}-04-01", end=f"{target_year+1}-03-31").date})
-        df_this["tag"] = df_this["date"].apply(lambda d: "past" if pd.to_datetime(d) <= yesterday else ("forecast" if pd.to_datetime(d) <= forecast_end else "normal"))
-        df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
+        df_this = pd.DataFrame({"date": pd.date_range(start=f"{target_year}-04-01", end=f"{target_year+1}-03-31")})
+        df_this["tag"] = df_this["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
+        df_this["month_day"] = df_this["date"].dt.strftime("%m-%d")
         df_this = df_this.merge(df_avg, on="month_day", how="left").merge(df_available, on="date", how="left")
         
         df_this["tave_this"] = np.where(df_this["tag"] == "normal", df_this["tave_avg"], df_this["tave_real"]).astype(float)
@@ -96,12 +103,12 @@ def get_climate_data():
         df_this["prcp_this"] = np.where(df_this["tag"] == "normal", 0.0, df_this["prcp_real"]).astype(float)
         df_this["prcp_this"] = pd.Series(df_this["prcp_this"]).fillna(0.0).round(1)
 
-        mask_f = (pd.to_datetime(df_this["date"]) >= (today - pd.Timedelta(days=1))) & (pd.to_datetime(df_this["date"]) <= (today + pd.Timedelta(days=7)))
+        mask_f = (df_this["date"] >= (today - pd.Timedelta(days=1))) & (df_this["date"] <= (today + pd.Timedelta(days=7)))
         df_forecast = df_this.loc[mask_f].copy() if mask_f.any() else pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
 
         def calc_acc(df_timeline, s_str, e_str, thresh, target):
             if not s_str or not e_str: return None, {}, {}
-            mask = (pd.to_datetime(df_timeline["date"]) >= pd.to_datetime(s_str)) & (pd.to_datetime(df_timeline["date"]) <= pd.to_datetime(e_str))
+            mask = (df_timeline["date"] >= pd.to_datetime(s_str)) & (df_timeline["date"] <= pd.to_datetime(e_str))
             df_ct = df_timeline.loc[mask].copy().reset_index(drop=True)
             if df_ct.empty: return None, {}, {}
             
@@ -109,7 +116,7 @@ def get_climate_data():
             df_ct["cum_ct"], df_ct["cum_pr"] = df_ct["daily_ct"].cumsum().round(1), df_ct["prcp_this"].cumsum().round(1)
             
             # ★ 未来の雨量は完全に消す
-            mask_fut = pd.to_datetime(df_ct["date"]).dt.date > forecast_end.date()
+            mask_fut = df_ct["date"] > forecast_end
             df_ct.loc[mask_fut, ["daily_pr", "cum_pr"]] = np.nan
             
             try:
@@ -129,8 +136,8 @@ def get_climate_data():
             return df_ct, cl_dict, corr_dict
 
         df_ct1, cl1, co1 = calc_acc(df_this, ct1_start_str, ct1_end_str, threshold1, gdd1_target)
-        mask_h = pd.to_datetime(df_this["date"]) <= yesterday
-        h1 = {"cum_ct": round(df_ct1.loc[pd.to_datetime(df_ct1["date"]) <= yesterday].iloc[-1]["cum_ct"], 1), "cum_pr": round(df_ct1.loc[pd.to_datetime(df_ct1["date"]) <= yesterday].iloc[-1]["cum_pr"], 1)} if (df_ct1 is not None and not df_ct1.loc[pd.to_datetime(df_ct1["date"]) <= yesterday].empty) else {}
+        mask_h = df_this["date"] <= yesterday
+        h1 = {"cum_ct": round(df_ct1.loc[df_ct1["date"] <= yesterday].iloc[-1]["cum_ct"], 1), "cum_pr": round(df_ct1.loc[df_ct1["date"] <= yesterday].iloc[-1]["cum_pr"], 1)} if (df_ct1 is not None and not df_ct1.loc[df_ct1["date"] <= yesterday].empty) else {}
 
         res = {"average": df_avg.to_dict(orient="records"), "this_year": df_this.to_dict(orient="records"), "forecast": df_forecast.to_dict(orient="records"),
                "ct1": df_ct1.to_dict(orient="records") if df_ct1 is not None else [], "gdd1_target": cl1, "gdd1_target_corr": co1, "ct1_until_yesterday": h1}
