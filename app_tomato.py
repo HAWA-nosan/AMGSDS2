@@ -57,6 +57,7 @@ def get_climate_data():
         current_year = today.year if today.month >= 4 else today.year - 1
         target_year = ct1_start_ts.year if ct1_start_ts.month >= 4 else ct1_start_ts.year - 1
 
+        # API制限を回避するため、安全な1年ごとのループ取得に戻しました
         all_years_data = [res for y in range(current_year - 3, current_year) if (res := get_cached_avg_data(y, lat, lon)) is not None]
 
         if all_years_data:
@@ -84,6 +85,7 @@ def get_climate_data():
             df_available_list.append(df_cy)
 
         df_available = pd.concat(df_available_list).drop_duplicates(subset=["date"], keep="last") if df_available_list else pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
+        
         df_this = pd.DataFrame({"date": pd.date_range(start=f"{target_year}-04-01", end=f"{target_year+1}-03-31").date})
         df_this["tag"] = df_this["date"].apply(lambda d: "past" if pd.to_datetime(d) <= yesterday else ("forecast" if pd.to_datetime(d) <= forecast_end else "normal"))
         df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
@@ -138,7 +140,7 @@ def get_climate_data():
             if isinstance(obj, dict): return {k: clean(v) for k, v in obj.items()}
             if pd.isna(obj): return ""
             if isinstance(obj, (np.integer, np.floating)): return float(obj) if not np.isnan(obj) else ""
-            if isinstance(obj, (pd.Timestamp, datetime, date)): return obj.strftime("%Y-%m-%d")
+            if isinstance(obj, (pd.Timestamp, datetime)): return obj.strftime("%Y-%m-%d")
             return obj
             
         return jsonify(clean(res))
