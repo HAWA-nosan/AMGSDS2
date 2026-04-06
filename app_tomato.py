@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta, date  # ★ここです！「date」を追記しました！
+from datetime import datetime, timedelta, date
 import pandas as pd
 import numpy as np
-import math
 import traceback
 import AMD_Tools4 as amd
 
@@ -18,11 +17,10 @@ def handle_exception(e):
 def get_climate_data():
     try:
         d = request.get_json()
-        lat, lon = float(d["lat"]), float(d["lon"])
+        lat, lon = map(float, (d["lat"], d["lon"]))
         threshold = float(d["threshold"])
         gdd1_target = float(d["gdd1"])
-        hosei = float(d.get("hosei", 0.0))
-        
+        hosei = float(d["hosei"])
         ct1_start = datetime.fromisoformat(d["ct1_start"]).date()  
         ct1_end   = datetime.fromisoformat(d["ct1_end"]).date()
         
