@@ -4,7 +4,11 @@ from datetime import datetime, timedelta, date
 import pandas as pd
 import numpy as np
 import traceback
-import AMD_Tools4 as amd
+
+try:
+    import AMD_Tools4 as amd
+except ImportError:
+    amd = None
 
 app = Flask(__name__)
 
@@ -27,15 +31,9 @@ def get_climate_data():
         
         today = datetime.utcnow().date()
         
-        # ──────────────────────────────────────────
-        # ★ 修正ポイント①：現実の年とシミュレーションの年を分ける
-        # ──────────────────────────────────────────
         real_this_year = today.year if today.month >= 4 else today.year - 1
-        # B6セルに入力された日付から、シミュレーション対象の「年度」を判定
         target_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
 
-        # --- ① 過去3年平均気温を算出する（M,N列） ---
-        # 平均気温は、現実の「現在」から過去3年分を取得します
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start = f"{year}-04-01"
@@ -71,60 +69,68 @@ def get_climate_data():
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # ──────────────────────────────────────────
-        # ★ 修正ポイント②：対象年度（2022年など）の実測値を取得
-        # ──────────────────────────────────────────
         start_this = f"{target_year}-04-01"
         end_this = f"{target_year + 1}-03-31"
+        
+        df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
         
         try:
             temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [start_this, end_this], [lat, lat, lon, lon])
             prcp_this, *_ = amd.GetMetData("APCPRA",  [start_this, end_this], [lat, lat, lon, lon])
             
             s_this_dates = pd.to_datetime(pd.Series(list(tim_this)))
-            df_this = pd.DataFrame({
+            df_api = pd.DataFrame({
                 "date"      : s_this_dates.dt.date,
-                "tave_this" : temp_this[:, 0, 0],
-                "prcp_this" : prcp_this[:, 0, 0]       
+                "tave_real" : temp_this[:, 0, 0],
+                "prcp_real" : prcp_this[:, 0, 0]       
             })    
         except Exception:
-            df_this = pd.DataFrame(columns=["date", "tave_this", "prcp_this"])
+            df_api = pd.DataFrame(columns=["date", "tave_real", "prcp_real"])
+
+        df_this = df_this.merge(df_api, on="date", how="left")
 
         yesterday = today - timedelta(days=1)
         forecast_end = today + timedelta(days=26)
 
-        # ② 過ぎた場合をpast、予報値をforecast、平年値をnormal
         def assign_tag(d):
-            if d <= yesterday: return "past"
-            elif d <= forecast_end: return "forecast"
-            else: return "normal"
+            if d <= yesterday:
+                return "past"
+            elif d <= forecast_end:
+                return "forecast"
+            else:
+                return "normal"
                 
         if not df_this.empty:
             df_this["tag"] = df_this["date"].map(assign_tag)
-            df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
-            df_forecast["date"] = df_forecast["date"].map(lambda d: d.isoformat() if isinstance(d, date) else d)
             
-            # ③ 予報値以降のnormalを過去3年平均に置き換えて表示する
             df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
             df_this = df_this.merge(df_avg[["month_day", "tave_avg"]], on="month_day", how="left")
-            mask = df_this["tag"] == "normal"
-            df_this.loc[mask, "tave_this"] = df_this.loc[mask, "tave_avg"]
-            # normalの降水量は0にする
-            df_this.loc[mask, "prcp_this"] = 0.0
+            
+            mask_normal = df_this["tag"] == "normal"
+            df_this["tave_this"] = df_this["tave_real"]
+            df_this.loc[mask_normal, "tave_this"] = df_this.loc[mask_normal, "tave_avg"]
+            
+            df_this["prcp_this"] = df_this["prcp_real"]
+            df_this.loc[mask_normal, "prcp_this"] = 0.0
+            
+            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1)
+            df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
 
-            df_this.drop(columns=["month_day", "tave_avg"], inplace=True)
+            df_this.drop(columns=["month_day", "tave_avg", "tave_real", "prcp_real"], inplace=True)
+            
+            df_forecast = df_this.loc[df_this["tag"] == "forecast"].reset_index(drop=True)
+            df_forecast["date"] = df_forecast["date"].map(lambda d: d.isoformat() if isinstance(d, date) else d)
         else:
             df_forecast = pd.DataFrame()
 
-        # ──────────────────────────────────────────
-        # ★ 修正ポイント③：積算範囲をB6～B7の期間だけに厳格に切り取る
-        # ──────────────────────────────────────────
         if not df_this.empty:
-            mask_ct1 = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
-            df_ct1 = df_this.loc[mask_ct1].copy().reset_index(drop=True)
+            mask = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
+            df_ct1_period = df_this.loc[mask].reset_index(drop=True)
         else:
-            df_ct1 = pd.DataFrame()
+            df_ct1_period = pd.DataFrame()
 
+        df_ct1 = df_ct1_period.copy()
+        
         if df_ct1.empty:
             closest_dict = {}
             corrected_dict = {}
@@ -135,7 +141,6 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
 
-            # 未来の雨量・積算雨量だけを空欄（NaN）にする
             mask_fut = df_ct1["date"] > forecast_end
             df_ct1.loc[mask_fut, "daily_pr"] = np.nan
             df_ct1.loc[mask_fut, "cum_pr"] = np.nan
@@ -172,7 +177,6 @@ def get_climate_data():
             else:
                 hist_dict = {"date": None, "cum_ct": None, "cum_pr": None}
 
-        # NaN → None 対応
         def replace_nan_with_none(data):
             if isinstance(data, list):
                 return [replace_nan_with_none(x) for x in data]
@@ -183,18 +187,20 @@ def get_climate_data():
             else:
                 return data
                 
-        # ここで date 列を文字列へ統一      
         if not df_this.empty: df_this["date"] = df_this["date"].map(lambda d: d.isoformat() if isinstance(d, date) else d)   
+        if not df_ct1_period.empty: df_ct1_period["date"] = df_ct1_period["date"].map(lambda d: d.isoformat() if isinstance(d, date) else d) 
         if not df_ct1.empty: df_ct1["date"] = df_ct1["date"].map(lambda d: d.isoformat() if isinstance(d, date) else d) 
         
         df_avg_clean = replace_nan_with_none(df_avg.to_dict(orient="records"))
         df_this_clean = replace_nan_with_none(df_this.to_dict(orient="records"))
+        df_ct1_period_clean = replace_nan_with_none(df_ct1_period.to_dict(orient="records"))
         df_ct1_clean = replace_nan_with_none(df_ct1.to_dict(orient="records"))
         df_forecast_clean = replace_nan_with_none(df_forecast.to_dict(orient="records")) if not df_forecast.empty else []
 
         return jsonify({
             "average": df_avg_clean,
             "this_year": df_this_clean,
+            "ct1_period": df_ct1_period_clean,
             "ct1"       : df_ct1_clean,
             "gdd1_target": closest_dict,
             "gdd1_target_corr"   : corrected_dict,      
@@ -204,7 +210,7 @@ def get_climate_data():
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        return jsonify({"status": "error", "message": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
