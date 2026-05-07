@@ -31,7 +31,7 @@ def get_climate_data():
         
         real_this_year = today.year if today.month >= 4 else today.year - 1
 
-        # --- ① 過去3年平均気温を算出（※平均気温のみ計算します） ---
+        # --- ① 過去3年平均気温を算出 ---
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start, end = f"{year}-04-01", f"{year+1}-03-31"
@@ -52,12 +52,15 @@ def get_climate_data():
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
             df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
+            
+            # ★ ここを追加！過去3年平均を「小数点2桁」で丸める
+            df_avg["tave_avg"] = df_avg["tave_avg"].round(2)
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # --- ② 対象期間の実測値取得（期間が1年以内なので1回の通信でズバッと取得） ---
+        # --- ② 対象期間の実測値取得 ---
         start_this = ct1_start
-        end_this = max(ct1_end, forecast_end) # 終了日と予報日の遠い方まで取得
+        end_this = max(ct1_end, forecast_end)
         
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
         try:
@@ -69,8 +72,8 @@ def get_climate_data():
             df_api = pd.DataFrame({
                 "date"      : pd.to_datetime(list(tim_this)).date,
                 "tave_real" : temp_this[:, 0, 0], 
-                "tmax_real" : tmax_this[:, 0, 0], # ★実測値のみを格納
-                "tmin_real" : tmin_this[:, 0, 0], # ★実測値のみを格納
+                "tmax_real" : tmax_this[:, 0, 0], 
+                "tmin_real" : tmin_this[:, 0, 0], 
                 "prcp_real" : prcp_this[:, 0, 0]
             })    
         except Exception:
@@ -90,13 +93,14 @@ def get_climate_data():
             
             mask = df_this["tag"] == "normal"
             
-            # 平均気温と雨量は、未来(normal)なら平年値・0に置き換え
             df_this["tave_this"] = np.where(mask, df_this["tave_avg"], df_this["tave_real"])
             df_this["prcp_this"] = np.where(mask, 0.0, df_this["prcp_real"])
+            
+            # P列の平均気温・降水量は1桁で統一
             df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1)
             df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
             
-            # ★最高・最低気温は実測値(real)をそのまま使う（未来は自然とNaNになる）
+            # 最高・最低気温は実測値(real)をそのまま使う
             df_this["tmax_this"] = df_this["tmax_real"].round(1)
             df_this["tmin_this"] = df_this["tmin_real"].round(1)
 
@@ -121,7 +125,7 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
             
-            # 将来の雨量は積算しない（昨日より未来はNaN）
+            # 将来の雨量は積算しない
             mask_fut_rain = df_ct1["date"] > yesterday
             df_ct1.loc[mask_fut_rain, ["daily_pr", "cum_pr"]] = np.nan
 
@@ -143,7 +147,7 @@ def get_climate_data():
         def clean_json(data):
             if isinstance(data, list): return [clean_json(x) for x in data]
             if isinstance(data, dict): return {k: clean_json(v) for k, v in data.items()}
-            if pd.isna(data): return "" # NaNの最高・最低気温はここで空白文字になります
+            if pd.isna(data): return "" 
             if isinstance(data, (date, datetime)): return data.isoformat()
             return data
                 
