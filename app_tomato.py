@@ -8,6 +8,7 @@ import AMD_Tools4 as amd
 
 app = Flask(__name__)
 
+# エラー時にJSONを返す安全装置
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
@@ -25,23 +26,23 @@ def get_climate_data():
         ct1_end   = pd.to_datetime(d["ct1_end"]).date()
         
         today = datetime.utcnow().date()
+        yesterday = today - timedelta(days=1)
+        forecast_end = today + timedelta(days=26)
+        
         real_this_year = today.year if today.month >= 4 else today.year - 1
-        target_year = ct1_start.year if ct1_start.month >= 4 else ct1_start.year - 1
 
-        # --- ① 過去3年平均気温・最高・最低を算出 ---
+        # --- ① 過去3年平均気温を算出（※平均気温のみ計算します） ---
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start, end = f"{year}-04-01", f"{year+1}-03-31"
             try:
                 temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
-                tmax, _, *_   = amd.GetMetData("TMP_max", [start, end], [lat, lat, lon, lon])
-                tmin, _, *_   = amd.GetMetData("TMP_min", [start, end], [lat, lat, lon, lon])
                 df = pd.DataFrame({
                     "datetime": pd.to_datetime(list(tim)),
-                    "tave": temp[:, 0, 0], "tmax": tmax[:, 0, 0], "tmin": tmin[:, 0, 0]
+                    "tave": temp[:, 0, 0]
                 })
                 df["month_day"] = df["datetime"].dt.strftime("%m-%d")
-                all_years_data.append(df[["month_day", "tave", "tmax", "tmin"]])
+                all_years_data.append(df[["month_day", "tave"]])
             except Exception: pass
 
         if all_years_data:
@@ -50,41 +51,29 @@ def get_climate_data():
             df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
-            df_avg.rename(columns={"tave":"tave_avg", "tmax":"tmax_avg", "tmin":"tmin_avg"}, inplace=True)
+            df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
         else:
-            df_avg = pd.DataFrame(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg"])
+            df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
 
-        # --- ② 対象年度の実測値取得（★年またぎ伸縮カレンダー対応！） ---
-        yesterday = today - timedelta(days=1)
-        forecast_end = today + timedelta(days=26)
-
-        # カレンダーの開始は4/1。終了日は「翌3/31」「指定した終了日」「予報の最終日」の中で一番遠い未来の日付にする！
-        start_this = date(target_year, 4, 1)
-        end_this = max(date(target_year + 1, 3, 31), ct1_end, forecast_end)
+        # --- ② 対象期間の実測値取得（期間が1年以内なので1回の通信でズバッと取得） ---
+        start_this = ct1_start
+        end_this = max(ct1_end, forecast_end) # 終了日と予報日の遠い方まで取得
         
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
-        
-        # API制限を回避するため、年ごとに細かく分けてデータを取得（チャンク取得）
-        df_api_list = []
-        for y in range(start_this.year, end_this.year + 1):
-            sy = f"{y}-01-01" if y > start_this.year else start_this.strftime("%Y-%m-%d")
-            ey = f"{y}-12-31" if y < end_this.year else end_this.strftime("%Y-%m-%d")
-            try:
-                temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [sy, ey], [lat, lat, lon, lon])
-                tmax_this, _, *_        = amd.GetMetData("TMP_max", [sy, ey], [lat, lat, lon, lon])
-                tmin_this, _, *_        = amd.GetMetData("TMP_min", [sy, ey], [lat, lat, lon, lon])
-                prcp_this, _, *_        = amd.GetMetData("APCPRA",  [sy, ey], [lat, lat, lon, lon])
-                df_chunk = pd.DataFrame({
-                    "date"      : pd.to_datetime(list(tim_this)).date,
-                    "tave_real" : temp_this[:, 0, 0], "tmax_real" : tmax_this[:, 0, 0],
-                    "tmin_real" : tmin_this[:, 0, 0], "prcp_real" : prcp_this[:, 0, 0]
-                })
-                df_api_list.append(df_chunk)
-            except Exception: pass
-
-        if df_api_list:
-            df_api = pd.concat(df_api_list).drop_duplicates(subset=["date"])
-        else:
+        try:
+            sy, ey = start_this.strftime("%Y-%m-%d"), end_this.strftime("%Y-%m-%d")
+            temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [sy, ey], [lat, lat, lon, lon])
+            tmax_this, _, *_        = amd.GetMetData("TMP_max", [sy, ey], [lat, lat, lon, lon])
+            tmin_this, _, *_        = amd.GetMetData("TMP_min", [sy, ey], [lat, lat, lon, lon])
+            prcp_this, _, *_        = amd.GetMetData("APCPRA",  [sy, ey], [lat, lat, lon, lon])
+            df_api = pd.DataFrame({
+                "date"      : pd.to_datetime(list(tim_this)).date,
+                "tave_real" : temp_this[:, 0, 0], 
+                "tmax_real" : tmax_this[:, 0, 0], # ★実測値のみを格納
+                "tmin_real" : tmin_this[:, 0, 0], # ★実測値のみを格納
+                "prcp_real" : prcp_this[:, 0, 0]
+            })    
+        except Exception:
             df_api = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
 
         df_this = df_this.merge(df_api, on="date", how="left")
@@ -98,21 +87,26 @@ def get_climate_data():
             df_this["tag"] = df_this["date"].map(assign_tag)
             df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
             df_this = df_this.merge(df_avg, on="month_day", how="left")
-            mask = df_this["tag"] == "normal"
-            df_this["tave_this"] = np.where(mask, df_this["tave_avg"], df_this["tave_real"])
-            df_this["tmax_this"] = np.where(mask, df_this["tmax_avg"], df_this["tmax_real"])
-            df_this["tmin_this"] = np.where(mask, df_this["tmin_avg"], df_this["tmin_real"])
-            df_this["prcp_this"] = np.where(mask, 0.0, df_this["prcp_real"])
             
-            for col, val in [("tave_this", 10.0), ("tmax_this", 14.0), ("tmin_this", 6.0), ("prcp_this", 0.0)]:
-                df_this[col] = df_this[col].fillna(val).round(1)
-            df_this.drop(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
+            mask = df_this["tag"] == "normal"
+            
+            # 平均気温と雨量は、未来(normal)なら平年値・0に置き換え
+            df_this["tave_this"] = np.where(mask, df_this["tave_avg"], df_this["tave_real"])
+            df_this["prcp_this"] = np.where(mask, 0.0, df_this["prcp_real"])
+            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1)
+            df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
+            
+            # ★最高・最低気温は実測値(real)をそのまま使う（未来は自然とNaNになる）
+            df_this["tmax_this"] = df_this["tmax_real"].round(1)
+            df_this["tmin_this"] = df_this["tmin_real"].round(1)
+
+            df_this.drop(columns=["month_day", "tave_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
             df_forecast = df_this.loc[df_this["tag"] == "forecast"].copy().reset_index(drop=True)
             df_forecast["date"] = df_forecast["date"].map(lambda d: d.isoformat())
         else:
             df_forecast = pd.DataFrame()
 
-        # --- ③ 積算処理 ---
+        # --- ③ 積算処理 (B6～B7の期間のみ) ---
         if not df_this.empty:
             mask_ct1 = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
             df_ct1 = df_this.loc[mask_ct1].copy().reset_index(drop=True)
@@ -127,7 +121,7 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
             
-            # 将来の雨量は積算しない
+            # 将来の雨量は積算しない（昨日より未来はNaN）
             mask_fut_rain = df_ct1["date"] > yesterday
             df_ct1.loc[mask_fut_rain, ["daily_pr", "cum_pr"]] = np.nan
 
@@ -145,10 +139,11 @@ def get_climate_data():
             else:
                 hist_dict = {"date": None, "cum_ct": None, "cum_pr": None}
 
+        # JSONの空欄（NaN）を空白文字に変換する処理
         def clean_json(data):
             if isinstance(data, list): return [clean_json(x) for x in data]
             if isinstance(data, dict): return {k: clean_json(v) for k, v in data.items()}
-            if pd.isna(data): return ""
+            if pd.isna(data): return "" # NaNの最高・最低気温はここで空白文字になります
             if isinstance(data, (date, datetime)): return data.isoformat()
             return data
                 
