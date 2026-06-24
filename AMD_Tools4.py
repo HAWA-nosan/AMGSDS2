@@ -19,44 +19,14 @@ AMD_Tools4.py
    14. mapfig:2次元配列のデータをシンプルな分布図として可視化する関数。
    15. linefig:１次元配列のデータをシンプルな折れ線グラフとして可視化する関数。
    16. correfig:相関図を描画する関数。
-   17. GetMetData_Area：メッシュ農業気象データを取得する関数(Area区切り対応版)。
-   18. GetSceData_Area：メッシュ温暖化シナリオデータを取得する関数(Area区切り対応版)。
-   19. GetGeoData_Area：土地利用や都道府県域などの地理情報を取得する関数(Area区切り対応版)。
-   20. GetMetDataHourly:メッシュ農業気象データ（時別値）を取得する関数。
-   21. GetMetDataHourlyX:メッシュ農業気象データ（時別値）を取得する関数(xarray出力版)。
+   17. GetMetDataHourly:メッシュ農業気象データ（時別値）を取得する関数。
+   18. GetMetDataHourlyX:メッシュ農業気象データ（時別値）を取得する関数(xarray出力版)。
 
     改変履歴：
-    20250408 複数の１次メッシュかつ複数の年に跨るデータが正しく取得できない不具合を解消
-    20250331 GetMetDataXの戻り値の時刻の属性にtimezoneが含まれていた不具合を解消
-    20250212 時別値xarray出力版の時刻timeをUTCとし、日本標準時stdtimeを新規に追加
-    20250115 GetMetDataHourlyX取得時間数修正および時間属性追加、領域取得インデックス修正、Numpyバージョンアップに伴うTimezone付加エラー修正、xarray出力版の不要次元削除、PutGeoTIFF関数追加、GetMetData関数日付期間をオブジェクトでも与えられるよう修正
-    20241003 GetGeoDataローカルデータ取得のバグを修正
-    20240917 PutGSI_Map関数の画像範囲等修正、correfig関数の1:1線描画のバグを修正
-    20240626 xtll_extract,tll_extractのlatlon出力をマスク無しに変更、GetGeoData等のバグを修正
-    20240614 取得格子点のバグを修正、
-    20240403 xarray形式の出力を追加(各関数末尾X), PutGSIMap関数関連map_figs修正, 描画関数を追加, 1次メッシュリスト修正
-    20201121 GetMetDataHourly 関数を追加 （時別値取得用関数）
-    20190221 GetCSVのエンコード問題に対応、１次メッシュ区分に対応
-    20180913 GetGeoDataのバグを修正
-    20180628 プロキシーサーバーに対応
-    20180405 IDパスワード認証に対応
-    20171204 Matplotlib2に対応
-    20171125 PutGSI_Map関数を追加
-    20170603 lonrange関数他を追加
-    20170518 GetCSV_List関数の追加
-    20170502 コメント文の修正
-    20170425 PutKMZ関数の改良
-    20170208 Python3バージョン
-    20140129 PurCSV_MTに機能を追加
-    20131118 3次メッシュコードをキーとする表として出力する関数(PurCSV_MT)の追加
-    20130314 地理情報を読み取る関数の追加
-    20121205 安定版初版
-    Copyright (C)  OHNO, Hiroyuki
+    20260224 GetMetDataHourly、GetMetDataHourlyX関数のバグを修正
+    20260216 新認証に対応
+     Copyright (C)  OHNO, Hiroyuki
 """
-#_引用符の中を 通知された認証情報で書き換えてください。___________
-USER="korei-ryo@awi.co.jp"
-PASSWORDS=["HAWAnousan2026", "HAWAnousan2026"] #二つのうち、どちらかが正しければデータは取得できます
-
 #_ プロキシーサーバー経由で接続する方は下も設定してください。______
 #　（使用しない場合はこのままにしてください）
 PROXY_IP = ""  #プロキシーサーバーのIPアドレス(文字列で)
@@ -66,9 +36,12 @@ PROXY_PORT = ""  #使用するポート番号(文字列で)
 #///////////// 以下には変更を加えないでください ////////////////////////
 from sys import exit
 from os import unlink #,fdopen
-from os.path import join,exists,isdir,basename
+from os.path import join,exists,isdir,basename, expanduser, abspath
 from datetime import datetime as dt, timedelta as td, timezone
 import argparse
+import json
+import time
+import base64
 from math import floor, ceil
 import numpy as np
 import numpy.ma as ma #PutKMZ_Mapで使ってる
@@ -93,7 +66,8 @@ from threading import Thread
 # ライブラリ（グラフ描画関数が使用）
 from matplotlib.colors import Normalize
 #plt.rcParams['font.family'] = 'Meiryo'  # Windows PC の場合、この行を有効にすると日本語が使えます
-#plt.rcParams['font.family'] = 'Hiragino Maru Gothic Pro'  # Macの場合はこの行のコメントアウトを外して使ってください。ただしMacOSによってはフォント名の表記揺れなどによりエラーになる場合があります
+#plt.rcParams['font.family'] = 'Hiragino Maru Gothic Pro'  # Macの場合はこの行を有効にしてください。（MacOSによってはフォント名の修正が必要になる場合があります）
+#plt.rcParams['font.family'] = 'IPAPGothic'  # Colabの場合はこの行を有効にしてください。(ランタイムマシンへのフォントインストールも別途必要です)
 import pandas as pd
 
 TIMEZERO = dt.strptime("1900-01-01","%Y-%m-%d")
@@ -124,21 +98,153 @@ MESHLIST = ['3622', '3623', '3624', '3631', '3641', '3724', '3725',
             '6642', '6643', '6644', '6645', '6741', '6742', '6840', 
             '6841', '6842']
 
-def check_user(error=False):
+AMGSDS_BASE_URL = 'https://amd2.rd.naro.go.jp/opendap-api/'
+OCI_BASE = "https://idcs-277be580d4864cef98b9c7d572600423.identity.oraclecloud.com"
+OCI_CLIENT_ID = "5e72bb0b28334e7ea392eebfb57a9f86"
+OCI_SCOPE = "openid profile email offline_access groups get_groups"
 
-    if USER == "利用者ID":
-        if error:
-            print("")
-            print("  ====> ファイルAMD_Tools4.pyの57-58行目に利用者IDとパスワードを指定してください。 <====")
-            print("")
-            exit(1)
-        else:
-            print("")
-            print("  ====> WARNING: userID and password are not set <====")
-            print("  ====> not all data sources can be used         <====")
-            print("")
+OCI_DEVICE_URL = f"{OCI_BASE}/oauth2/v1/device"
+OCI_TOKEN_URL = f"{OCI_BASE}/oauth2/v1/token"
+OCI_HEADERS_FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+OCI_TOKEN_FILE = expanduser("~/.idcs_device_tokens.json")
 
-check_user()
+def save_tokens(data) -> None:
+    try:
+        with open(OCI_TOKEN_FILE, "w") as f:
+            json.dump({
+                "access_token": data.get("access_token"),
+                "refresh_token": data.get("refresh_token"),
+                "expires_in": data.get("expires_in"),
+                "obtained_at": int(time.time())
+            }, f)
+    except Exception as e:
+        print(f'トークンファイルを保存できませんでした。{abspath(OCI_TOKEN_FILE)}に書き込めるか確認してください。')
+        raise
+
+def load_tokens():
+    if not exists(OCI_TOKEN_FILE):
+        return None
+    try:
+        with open(OCI_TOKEN_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f'トークンファイルを開けませんでした。{abspath(OCI_TOKEN_FILE)}を確認してください。')
+        raise
+
+def is_access_token_valid(tokens, skew = 30):
+    if not tokens or "access_token" not in tokens or "expires_in" not in tokens or "obtained_at" not in tokens:
+        return False
+    now = int(time.time())
+    return (tokens["obtained_at"] + tokens["expires_in"] - skew) > now
+
+def device_authorize():
+    """ デバイスコードを取得 """
+    payload = {
+        "client_id": OCI_CLIENT_ID,
+        "response_type": "device_code",
+        "scope": OCI_SCOPE,
+    }
+    
+    req = urllib.request.Request(OCI_DEVICE_URL, urllib.parse.urlencode(payload).encode('utf-8'), OCI_HEADERS_FORM)
+    print(payload)
+    try:
+        with urllib.request.urlopen(req) as res:
+            print(res)
+            d = json.load(res)
+            print("=== デバイスコード ===")
+            print("User Code         :", d["user_code"])
+            print("Verification URL  :", d["verification_uri"])
+            print("有効期限(秒)        :", d["expires_in"])
+            print("\n上記URLを開いて User Code を入力・承認してください…")
+            return d
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        print('デバイスコードの取得ができませんでした。')
+        raise
+
+
+def poll_for_tokens(device_code: str, interval: int, expires_in: int) -> dict:
+    """
+    ユーザー承認が完了するまでアクセストークンをポーリングして取得する。
+    """
+    payload = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+        "client_id": OCI_CLIENT_ID,
+    }
+    POLL_MAX_SECONDS = 300
+    deadline = min(expires_in, POLL_MAX_SECONDS)
+    wait = max(10, int(interval or 5))
+    start = time.time()
+    
+    while True:
+        if time.time() - start > deadline:
+            raise TimeoutError('タイムアウトしました。')
+        
+        req = urllib.request.Request(OCI_TOKEN_URL, urllib.parse.urlencode(payload).encode('utf-8'), OCI_HEADERS_FORM)
+        try:
+            with urllib.request.urlopen(req) as res:
+                data = json.load(res)
+                data["obtained_at"] = int(time.time())
+                save_tokens(data)
+                print(">>> アクセストークン取得完了")
+                return data
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            try:
+                err_body = e.read().decode()
+                err_data = json.loads(err_body)
+                error_code = err_data.get("error")
+                if error_code == "authorization_pending":
+                    pass  # 承認待ち
+                elif error_code == "slow_down":
+                    wait += 5  # インターバルを延長
+                elif error_code in ("expired_token", "access_denied"):
+                    raise RuntimeError(f"device flow aborted: {error_code} ({err_data.get('error_description')})")
+                else:
+                    raise RuntimeError(f"unexpected error: {error_code} ({err_data.get('error_description')})")
+            except Exception as inner:
+                print("Unknown:", inner)
+                raise
+        time.sleep(wait)
+
+
+def refresh_access_token(refresh_token):
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OCI_CLIENT_ID,  # client_secret 不要（クライアントの設定次第）
+    }
+    try:
+        req = urllib.request.Request(OCI_TOKEN_URL, urllib.parse.urlencode(payload).encode('utf-8'), OCI_HEADERS_FORM)
+        with urllib.request.urlopen(req) as res:
+            data = json.load(res)
+            data["obtained_at"] = int(time.time())
+            save_tokens(data)
+            print(">>> アクセストークンをリフレッシュしました")
+            return data
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        print('トークンのリフレッシュができませんでした。')
+        raise
+
+def ensure_tokens() -> dict:
+    """ 有効なATを返す。なければデバイスフロー、期限切れならRTで更新 """
+    tokens = load_tokens()
+    if tokens and is_access_token_valid(tokens):
+        return tokens
+
+    if tokens and tokens.get("refresh_token"):
+        try:
+            return refresh_access_token(tokens["refresh_token"])
+        except Exception as e:
+            print("トークンのリフレッシュが失敗しました。:", e)
+
+    # 新規認可
+    dev = device_authorize()
+    interval = int(dev.get("interval", 5))
+    return poll_for_tokens(dev["device_code"], interval, int(dev["expires_in"]))
+
+def get_access_token():
+    token = ensure_tokens()
+    return token['access_token']
 
 def urljoin(xs):
     if len(xs) <= 1:
@@ -337,7 +443,6 @@ def xlatlon_fix(dhs, td, isArea=False):
         DataSetオブジェクトのリスト
     '''
     if td.beg.year == td.end.year: # 単一年内の場合
-
         if isArea:
             return dhs
         else:
@@ -389,7 +494,8 @@ class Area:
         else:
             eIdx = self.lonIdx[self.num]
         #print(f'[{sIdx}:1:{nIdx}][{wIdx}:1:{eIdx}]:{ll}')
-        return f'[{sIdx}:1:{nIdx}][{wIdx}:1:{eIdx}]'
+        #return f'[{sIdx}:1:{nIdx}][{wIdx}:1:{eIdx}]'
+        return (f'[{sIdx}:1:{nIdx}]',f'[{wIdx}:1:{eIdx}]')
 
 AREAS = {
     "北海道" : Area("北海道",1, 118/3, 46.0, 139.0, 146.0),
@@ -494,7 +600,8 @@ class LatLonDomain:
         nIdx = self.calcCodeIdx(s, n, self.latmax, True, True)
         wIdx = self.calcCodeIdx(w, e, self.lonmin, False, False)
         eIdx = self.calcCodeIdx(w, e, self.lonmax, False, True)
-        return f'[{sIdx}:1:{nIdx}][{wIdx}:1:{eIdx}]'
+        #return f'[{sIdx}:1:{nIdx}][{wIdx}:1:{eIdx}]'
+        return (f'[{sIdx}:1:{nIdx}]',f'[{wIdx}:1:{eIdx}]')
 
     def calcCodeIdx(self, vmin, vmax, v, lat=True, end=True):
         if lat:
@@ -705,7 +812,7 @@ def get_idx_url(url):
 def url2dh(url):
     url = url.replace("\\","/")
     a,b = url.split("?")
-    no_pw = not (url.startswith("https://amd.rd.naro.go.jp") or url.startswith('https://amd.db.naro.go.jp') or url.startswith('https://amd2.db.naro.go.jp'))
+    no_pw = not url.startswith("https://")
 
     if no_pw:
         try: #try local storage
@@ -727,45 +834,42 @@ def url2dh(url):
         else:
             return None, None
     else:
-        check_user(error=True)
-        for pw in PASSWORDS:
-            #print("accessing URL",url)
-            q = urllib.request.Request(url)
-            q.add_header('User-Agent','curl/7.50.1')
-            q.add_header('Accept','*/*')
-            mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()  #
-            #print("USER",USER,"PW",pw)
-            mgr.add_password(None, url, USER, pw)
-            auth_handler = urllib.request.HTTPBasicAuthHandler(mgr)
-            if PROXY_IP:
-                print(f"using proxy IP: {PROXY_IP} port:{PROXY_PORT}")
-                proxy = urllib.request.ProxyHandler({'https':PROXY_IP+':'+PROXY_PORT})
-                opener = urllib.request.build_opener(proxy,auth_handler)
-            else:
-                opener = urllib.request.build_opener(auth_handler)
-            urllib.request.install_opener(opener)
-            try:
-                response = urllib.request.urlopen(q)
-            except urllib.error.HTTPError:
-                #print("WRONG PW",pw)
-                continue
-                #raise
-            data = response.read()
-            d = tempfile.gettempdir()
-            p = "amd_cache_" + str(randint(100000000,999999999))
-            dfile = join(d,p)
-            f = open(dfile,"wb")
+        access_token = get_access_token()
+
+        q = urllib.request.Request(url)
+        q.add_header('User-Agent','curl/7.50.1')
+        q.add_header('Accept','*/*')
+        q.add_header('Authorization', f'Bearer {access_token}')
+        
+        if PROXY_IP:
+            print(f"using proxy IP: {PROXY_IP} port:{PROXY_PORT}")
+            proxy = urllib.request.ProxyHandler({'https':PROXY_IP+':'+PROXY_PORT})
+            opener = urllib.request.build_opener(proxy)
+        else:
+            opener = urllib.request.build_opener()
+        urllib.request.install_opener(opener)
+        try:
+            response = urllib.request.urlopen(q)
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            print(f'データを取得できませんでした。:{url}')
+            raise
+
+        data = response.read()
+        d = tempfile.gettempdir()
+        p = "amd_cache_" + str(randint(100000000,999999999))
+        dfile = join(d,p)
+
+        with open(dfile,"wb") as f:
             f.write(data)
-            f.close()
-            dh = load_dataset(dfile)
-            if dh and dfile and len(dh.dims)==3:
-                dh.time.attrs = {'long_name':'time'}
-            return dh, dfile
+        dh = load_dataset(dfile)
+        if dh and dfile and len(dh.dims)==3:
+            dh.time.attrs = {'long_name':'time'}
+        return dh, dfile
     raise ValueError("Network error found. Please check id and password or try again after a while. ",a)
 
 
 def GetMetData_Area(element, timedomain, lalodomain, area=None,
-               cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+               cli=False, namuni=False, url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(Area区切り対応版)。
@@ -806,20 +910,21 @@ def GetMetData_Area(element, timedomain, lalodomain, area=None,
     if area is None:
         area = lld.get_area()
     td = TimeDomain(*timedomain)
-    filename = 'AMD_' + area +'_' + ('Cli_' if cli else '') + element + '.nc.nc'
+    filename = 'AMD_' + area +'_' + ('Cli_' if cli else '') + element + '.nc.dap.nc4'
 
     dhs, dhpaths = [], []
 
     years = td.getIdx()
     for year, tidx in years:
-        opendap_source = urljoin([url,area,str(year),filename]) + '?' + element + tidx + lld.getIdx()
+        cidx = lld.getIdx()
+        opendap_source = urljoin([url,area,str(year),filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'{element}{tidx}{cidx[0]}{cidx[1]}'
         dh,dhpath = url2dh(opendap_source)
         if dhpath is not None:
             dhpaths.append(dhpath)
         if dh is not None:
             dhs.append(dh)
     
-    dh = xr.merge(xlatlon_fix(dhs, td, True))
+    dh = xr.merge(xlatlon_fix(dhs, td, True), join='outer', compat='no_conflicts')
     
     ## 取得したデータの要素名と次元を表示
     print(('Cli_' if cli else '')+element, '('+str(len(dh.time))+', '+str(len(dh.lat))+', '+str(len(dh.lon))+') Area')
@@ -836,7 +941,7 @@ def GetMetData_Area(element, timedomain, lalodomain, area=None,
 
 
 def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
-               namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS'):
+               namuni=False, url=f'{AMGSDS_BASE_URL}AMS'):
     """
 概要：
     気候予測シナリオデータを、データ配信サーバーまたはローカルファイルから取得する関数(Area区切り対応版)。
@@ -879,17 +984,18 @@ def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
     if area is None:
         area = lld.get_area()
     td = TimeDomain(*timedomain)
-    filename = 'AMS_' + area +'_' + element + '.nc.nc'
+    filename = 'AMS_' + area +'_' + element + '.nc.dap.nc4'
     dhs, dhpaths = [], []
     years = td.getIdx()
     for year, tidx in years:
-        opendap_source = urljoin([url,model,scenam,area,str(year),filename]) + '?' + element + tidx + lld.getIdx()
+        cidx = lld.getIdx()
+        opendap_source = urljoin([url,model,scenam,area,str(year),filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
         dh,dhpath = url2dh(opendap_source)
         if dhpath is not None:
             dhpaths.append(dhpath)
         if dh is not None:
             dhs.append(dh)
-    dh = xr.merge(dhs)
+    dh = xr.merge(dhs, join='outer', compat='no_conflicts')
     
     ## 取得したデータの要素名と次元を表示
     print(element, '('+str(len(dh.time))+', '+str(len(dh.lat))+', '+str(len(dh.lon))+') Area '+model+' '+scenam+')')
@@ -906,7 +1012,7 @@ def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
 
 
 def GetGeoData_Area(element, lalodomain, area=None,
-               namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+               namuni=False, url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     土地利用区分等の地理情報をデータ配信サーバーまたはローカルファイルから取得する関数(Area区切り対応版)。
@@ -939,8 +1045,9 @@ def GetGeoData_Area(element, lalodomain, area=None,
     lld = LatLonDomain(*lalodomain,area)
     if area is None:
         area = lld.get_area()
-    filename = 'AMD_' + area +'_Geo_' + element + '.nc.nc'
-    opendap_source = urljoin([url,area,'GeoData',filename]) + '?' + element + lld.getIdx()
+    filename = 'AMD_' + area +'_Geo_' + element + '.nc.dap.nc4'
+    cidx = lld.getIdx()
+    opendap_source = urljoin([url,area,'GeoData',filename]) + '?dap4.ce=' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{cidx[0]}{cidx[1]}'
     dh,dhpath = url2dh(opendap_source)
     
     ## 取得したデータの要素名と次元を表示
@@ -1389,9 +1496,9 @@ def mapfig(arr,lat,lon,
     plt.show() #表示
 
 
-def linefig(time,var,title='',ylabel='',llabel='', 
-               timeref=None,ref=None,ylabelref='',llabelref='',
-               commony=True,figsize=(12,4),filename=None):
+def linefig(x, var, title='', xlabel='Date', ylabel='', llabel='', 
+               xref=None,ref=None,ylabelref='',llabelref='',
+               commony=True,figsize=(10,3),filename=None):
     """
 概要：
     １次元配列のデータをシンプルな折れ線グラフとして可視化する関数
@@ -1400,18 +1507,19 @@ def linefig(time,var,title='',ylabel='',llabel='',
     　・横軸は主線/参照線で共通にも独立にも設定できる
     　・グラフタイトル、軸ラベル、データ凡例を付加できる
 引数(必須)：
-      time： 折れ線グラフの日付軸となるdatetimeオブジェクト１次元配列
+      x： 折れ線グラフの横軸となる１次元配列
       var： 折れ線の値の１次元配列
 引数(必要に応じ指定)：
       title: title="文字列" とすると、図の上にその文字列を表示する。
+      xlabel: xlabel="文字列" とすると、横軸にその文字列を表示する(横軸ラベル)。
       ylabel: ylabel="文字列" とすると、縦軸にその文字列を表示する(縦軸ラベル)。
       llabel: llabel="文字列" とすると、凡例を付け文字列を表示する(凡例ラベル)。
-      timeref: 参照の折れ線の時刻の配列（与えられなければtimeが用いられる）
+      xref: 参照の折れ線の時刻の配列（与えられなければxが用いられる）
       ref: 折れ線のほかに参照の折れ線を表示したいときにそのデータを与える。
       ylabelref: 参照の折れ線の縦軸ラベル
       llabelref: 参照の折れ線の凡例ラベル
       commony: commony=Falseとすると第２縦軸を用意する
-      figsize: 図の横,縦のサイズ　デフォルトでは横12縦4インチ
+      figsize: 図の横,縦のサイズ　デフォルトでは横10縦3インチ
       filename: 図をpngファイルで保存したいときにファイル名を指定する
 戻り値：
       なし
@@ -1425,44 +1533,48 @@ def linefig(time,var,title='',ylabel='',llabel='',
     #ax.xaxis.set_major_formatter(xmajoFmt)
     #xminoPos = DayLocator()
     #ax.xaxis.set_minor_locator(xminoPos)
-    ax.set_xlabel("Date")    
+    ax.set_xlabel(xlabel)    
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     # 主折れ線の描画
-    ax.plot(time, var.T,label=llabel, linewidth=3, marker="o") # 複数の線を引くときはシンプルにした方がよいかも
+    if type(var) is not np.ndarray:
+        var = np.array(var)
+    ax.plot(x, var.T,label=llabel, linewidth=3, marker="o") # 複数の線を引くときはシンプルにした方がよいかも
     if llabel != '':
         ax.legend(loc='upper left')
     # 参照折れ線の描画
     if ref is not None:
+        if type(ref) is not np.ndarray:
+            ref = np.array(ref)
         # 時間軸共用
-        if timeref is None:
+        if xref is None:
             if commony:
-                ax.plot(time,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
+                ax.plot(x,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
                 if llabelref != '':
                     ax.legend(loc='upper left')
             else:
                 ax2 = ax.twinx()
                 ax2.set_ylabel(ylabelref)
-                ax2.plot(time,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
+                ax2.plot(x,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
                 if llabelref != '':
                     ax2.legend(loc='upper right')
         # 時間軸独立
         else:
             if commony:
-                ax.plot(timeref,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
+                ax.plot(xref,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
                 if llabelref != '':
                     ax.legend(loc='upper left')
             else:
                 ax2 = ax.twinx()
                 ax2.set_ylabel(ylabelref)
-                ax2.plot(timeref,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
+                ax2.plot(xref,ref.T,label=llabelref, color='brown')#, linewidth=3, marker="o")
                 if llabelref != '':
                     ax2.legend(loc='upper right')
     # 画像ファイルの保存
     if type(filename) == str :
         fig.savefig(filename, dpi=600)
     plt.show() #表示
-
+    
 
 def correfig(x, y, title='', xlabel='', ylabel='',figsize=(3,3), filename=None, **kwargs):
     """
@@ -1492,7 +1604,7 @@ def correfig(x, y, title='', xlabel='', ylabel='',figsize=(3,3), filename=None, 
 
 
 def GetGeoData(element, lalodomain, namuni=False,
-               url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+               url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     土地利用区分等の地理情報をデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応)。
@@ -1524,14 +1636,14 @@ def GetGeoData(element, lalodomain, namuni=False,
     lld = LatLonDomain(*lalodomain)
     dh,dhpath = {},{}
     for code, cIdx in lld.getCodeWithIdx():
-        filename = f'AMDy____p{code}g{element}.nc.nc'
-        opendap_source = urljoin([url,'geodata',f'g{element}',filename]) + '?' + element + cIdx
+        filename = f'AMDy____p{code}g{element}.nc.dap.nc4'
+        opendap_source = urljoin([url,'geodata',f'g{element}',filename]) + '?dap4.ce=' + f'/lat{cIdx[0]};' + f'/lon{cIdx[1]};' + f'/{element}{cIdx[0]}{cIdx[1]}'
         dh[code],dhpath[code] = url2dh(opendap_source)
 
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
 
     for ds in dh.values():
         ds.close()
@@ -1557,7 +1669,7 @@ def GetGeoData(element, lalodomain, namuni=False,
 
 
 def GetGeoDataX(element, lalodomain,
-               url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+               url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     土地利用区分等の地理情報をデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応,xarray出力版)。
@@ -1582,14 +1694,14 @@ def GetGeoDataX(element, lalodomain,
     lld = LatLonDomain(*lalodomain)
     dh,dhpath = {},{}
     for code, cIdx in lld.getCodeWithIdx():
-        filename = f'AMDy____p{code}g{element}.nc.nc'
-        opendap_source = urljoin([url,'geodata',f'g{element}',filename]) + '?' + element + cIdx
+        filename = f'AMDy____p{code}g{element}.nc.dap.nc4'
+        opendap_source = urljoin([url,'geodata',f'g{element}',filename]) + '?dap4.ce=' + f'/lat{cIdx[0]};' + f'/lon{cIdx[1]};' + f'/{element}{cIdx[0]}{cIdx[1]}'
         dh[code],dhpath[code] = url2dh(opendap_source)
 
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
 
     for ds in dh.values():
         ds.close()
@@ -1602,7 +1714,7 @@ def GetGeoDataX(element, lalodomain,
 
 
 def GetMetData(element, timedomain, lalodomain,
-                 cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+                 cli=False, namuni=False, url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応)。
@@ -1644,14 +1756,14 @@ def GetMetData(element, timedomain, lalodomain,
     ec = "c" if cli else "e"
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMDy{year}p{code}{ec}{element}.nc.nc'
-            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMDy{year}p{code}{ec}{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?dap4.ce='+ f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dh[code,year],dhpath[code,year] = url2dh(opendap_source)
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(xlatlon_fix(dh, td))
-    
+    m = xr.merge(xlatlon_fix(dh, td), join='outer', compat='no_conflicts')
+
     ## 取得したデータの要素名と次元を表示
     print(('Cli_' if cli else '')+element, '('+str(len(m.time))+', '+str(len(m.lat))+', '+str(len(m.lon))+') Tile')
     
@@ -1671,7 +1783,7 @@ def GetMetData(element, timedomain, lalodomain,
 
 
 def GetMetDataX(element, timedomain, lalodomain,
-                 cli=False, url='https://amd.rd.naro.go.jp/opendap/AMD/'):
+                 cli=False, url=f'{AMGSDS_BASE_URL}AMD/'):
     """
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応, xarray出力版)。
@@ -1704,22 +1816,22 @@ def GetMetDataX(element, timedomain, lalodomain,
     ec = "c" if cli else "e"
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMDy{year}p{code}{ec}{element}.nc.nc'
-            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMDy{year}p{code}{ec}{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dh[code,year],dhpath[code,year] = url2dh(opendap_source)
 
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
     
-    m = xr.merge(xlatlon_fix(dh, td))
+    m = xr.merge(xlatlon_fix(dh, td), join='outer', compat='no_conflicts')
     for path in dhpath.values():
         if path is not None:
             StartUnlink(path)
     return m[element].squeeze()
 
 
-def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS'):
+def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url=f'{AMGSDS_BASE_URL}AMS'):
     """
 概要：
     気候予測シナリオデータを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応版)。
@@ -1763,13 +1875,13 @@ def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url
     dh,dhpath = {},{}
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMSy{year}p{code}e{element}.nc.nc'
-            opendap_source = urljoin([url,model,scenam,f'{year}',f'e{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMSy{year}p{code}e{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,model,scenam,f'{year}',f'e{element}',filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dh[code,year],dhpath[code,year] = url2dh(opendap_source)
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
 
     
     ## 取得したデータの要素名と次元を表示
@@ -1791,7 +1903,7 @@ def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url
     
 
 def GetSceDataX(element, timedomain, lalodomain, model, scenam,
-               url='https://amd.rd.naro.go.jp/opendap/AMS'):
+               url=f'{AMGSDS_BASE_URL}AMS'):
     """
 概要：
     気候予測シナリオデータを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応版, xarray出力版)。
@@ -1826,13 +1938,13 @@ def GetSceDataX(element, timedomain, lalodomain, model, scenam,
     dh,dhpath = {},{}
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMSy{year}p{code}e{element}.nc.nc'
-            opendap_source = urljoin([url,model,scenam,f'{year}',f'e{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMSy{year}p{code}e{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,model,scenam,f'{year}',f'e{element}',filename]) + '?dap4.ce=/' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dh[code,year],dhpath[code,year] = url2dh(opendap_source)
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
     for path in dhpath.values():
         if path is not None:
             StartUnlink(path)
@@ -1840,7 +1952,7 @@ def GetSceDataX(element, timedomain, lalodomain, model, scenam,
 
 
 def GetMetDataHourly(element, timedomain, lalodomain,
-                cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly'):
+                cli=False, namuni=False, url=f'{AMGSDS_BASE_URL}AMD_Hourly'):
     """
 概要：
     メッシュ農業気象データ時別値を、気象データをデータ配信サーバーまたはローカルファイルから取得する関数。
@@ -1881,14 +1993,14 @@ def GetMetDataHourly(element, timedomain, lalodomain,
 
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMDy{year}p{code}{ec}_h_{element}.nc.nc'
-            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMDy{year}p{code}{ec}_h_{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dhh, dfh = url2dh(opendap_source)
             dh[code,year],dhpath[code,year] = add_stdtime(dhh, dfh)
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
     for path in dhpath.values():
         if path is not None:
             StartUnlink(path)
@@ -1903,7 +2015,7 @@ def GetMetDataHourly(element, timedomain, lalodomain,
 
 
 def GetMetDataHourlyX(element, timedomain, lalodomain,
-                cli=False, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly'):
+                cli=False, url=f'{AMGSDS_BASE_URL}AMD_Hourly'):
     """
 概要：
     メッシュ農業気象データ時別値を、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(xarray出力版)。
@@ -1935,8 +2047,8 @@ def GetMetDataHourlyX(element, timedomain, lalodomain,
     ec = "c" if cli else "e"
     for year, tidx in td.getIdx():
         for code, cidx in lld.getCodeWithIdx():
-            filename = f'AMDy{year}p{code}{ec}_h_{element}.nc.nc'
-            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?' + element + tidx + cidx
+            filename = f'AMDy{year}p{code}{ec}_h_{element}.nc.dap.nc4'
+            opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dhh, dfh = url2dh(opendap_source)
             dh[code,year],dhpath[code,year] = add_stdtime(dhh, dfh)
 #            dh[code,year],dhpath[code,year] = url2dh(opendap_source)
@@ -1944,7 +2056,7 @@ def GetMetDataHourlyX(element, timedomain, lalodomain,
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
         return None
-    m = xr.merge(dh.values())
+    m = xr.merge(dh.values(), join='outer', compat='no_conflicts')
     for path in dhpath.values():
         if path is not None:
             StartUnlink(path)
@@ -1959,7 +2071,7 @@ def main():
         "これ自身を実行しても何も起こりません。配置だけしてください。"
     )
     parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-v', '--version', action='version', version='%(prog)s 4.0.9')
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s 4.1.1')
     args = parser.parse_args()
     
     #引数を何も与えない場合    
