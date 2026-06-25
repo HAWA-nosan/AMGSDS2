@@ -53,7 +53,6 @@ def get_climate_data():
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
             df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
             
-            # ★ ここを追加！過去3年平均を「小数点2桁」で丸める
             df_avg["tave_avg"] = df_avg["tave_avg"].round(2)
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
@@ -63,21 +62,29 @@ def get_climate_data():
         end_this = max(ct1_end, forecast_end)
         
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
-        try:
-            sy, ey = start_this.strftime("%Y-%m-%d"), end_this.strftime("%Y-%m-%d")
-            temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [sy, ey], [lat, lat, lon, lon])
-            tmax_this, _, *_        = amd.GetMetData("TMP_max", [sy, ey], [lat, lat, lon, lon])
-            tmin_this, _, *_        = amd.GetMetData("TMP_min", [sy, ey], [lat, lat, lon, lon])
-            prcp_this, _, *_        = amd.GetMetData("APCPRA",  [sy, ey], [lat, lat, lon, lon])
-            df_api = pd.DataFrame({
-                "date"      : pd.to_datetime(list(tim_this)).date,
-                "tave_real" : temp_this[:, 0, 0], 
-                "tmax_real" : tmax_this[:, 0, 0], 
-                "tmin_real" : tmin_this[:, 0, 0], 
-                "prcp_real" : prcp_this[:, 0, 0]
-            })    
-        except Exception:
-            df_api = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
+        
+        # ★ 修正ポイント：農研機構への「実測値」のリクエストは「昨日」までに制限する
+        fetch_start = start_this
+        fetch_end = min(end_this, yesterday)
+        
+        df_api = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
+        
+        if fetch_start <= fetch_end:
+            try:
+                sy, ey = fetch_start.strftime("%Y-%m-%d"), fetch_end.strftime("%Y-%m-%d")
+                temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [sy, ey], [lat, lat, lon, lon])
+                tmax_this, _, *_        = amd.GetMetData("TMP_max", [sy, ey], [lat, lat, lon, lon])
+                tmin_this, _, *_        = amd.GetMetData("TMP_min", [sy, ey], [lat, lat, lon, lon])
+                prcp_this, _, *_        = amd.GetMetData("APCPRA",  [sy, ey], [lat, lat, lon, lon])
+                df_api = pd.DataFrame({
+                    "date"      : pd.to_datetime(list(tim_this)).date,
+                    "tave_real" : temp_this[:, 0, 0], 
+                    "tmax_real" : tmax_this[:, 0, 0], 
+                    "tmin_real" : tmin_this[:, 0, 0], 
+                    "prcp_real" : prcp_this[:, 0, 0]
+                })    
+            except Exception as e:
+                print("API Fetch Error:", e)
 
         df_this = df_this.merge(df_api, on="date", how="left")
 
@@ -91,16 +98,12 @@ def get_climate_data():
             df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
             df_this = df_this.merge(df_avg, on="month_day", how="left")
             
-            mask = df_this["tag"] == "normal"
+            # ★ 修正ポイント：実測値があれば使い、無い部分（未来）は過去3年平均値（tave_avg）で埋める
+            df_this["tave_this"] = df_this["tave_real"].fillna(df_this["tave_avg"])
+            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1) # 最終安全装置
             
-            df_this["tave_this"] = np.where(mask, df_this["tave_avg"], df_this["tave_real"])
-            df_this["prcp_this"] = np.where(mask, 0.0, df_this["prcp_real"])
+            df_this["prcp_this"] = df_this["prcp_real"].fillna(0.0).round(1)
             
-            # P列の平均気温・降水量は1桁で統一
-            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1)
-            df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
-            
-            # 最高・最低気温は実測値(real)をそのまま使う
             df_this["tmax_this"] = df_this["tmax_real"].round(1)
             df_this["tmin_this"] = df_this["tmin_real"].round(1)
 
@@ -125,7 +128,6 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
             
-            # 将来の雨量は積算しない
             mask_fut_rain = df_ct1["date"] > yesterday
             df_ct1.loc[mask_fut_rain, ["daily_pr", "cum_pr"]] = np.nan
 
@@ -143,7 +145,6 @@ def get_climate_data():
             else:
                 hist_dict = {"date": None, "cum_ct": None, "cum_pr": None}
 
-        # JSONの空欄（NaN）を空白文字に変換する処理
         def clean_json(data):
             if isinstance(data, list): return [clean_json(x) for x in data]
             if isinstance(data, dict): return {k: clean_json(v) for k, v in data.items()}
