@@ -8,7 +8,7 @@ import socket  # ★追加：通信をコントロールするための標準ラ
 import AMD_Tools4 as amd
 
 # ★最強の安全装置：NAROサーバーからの返事が15秒来なければ、永遠に待たずに通信を強制切断する
-socket.setdefaulttimeout(15.0)
+socket.setdefaulttimeout(60.0)
 
 app = Flask(__name__)
 
