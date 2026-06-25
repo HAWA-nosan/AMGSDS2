@@ -25,16 +25,18 @@ AMD_Tools4.py
     改変履歴：
     20260224 GetMetDataHourly、GetMetDataHourlyX関数のバグを修正
     20260216 新認証に対応
+    20260625 クラウド(Render)環境での環境変数認証・自動ログインに対応
      Copyright (C)  OHNO, Hiroyuki
 """
 #_ プロキシーサーバー経由で接続する方は下も設定してください。______
-#　（使用しない場合はこのままにしてください）
+# （使用しない場合はこのままにしてください）
 PROXY_IP = ""  #プロキシーサーバーのIPアドレス(文字列で)
 PROXY_PORT = ""  #使用するポート番号(文字列で)
 
 #_______________________________________________________
 #///////////// 以下には変更を加えないでください ////////////////////////
 from sys import exit
+import os
 from os import unlink #,fdopen
 from os.path import join,exists,isdir,basename, expanduser, abspath
 from datetime import datetime as dt, timedelta as td, timezone
@@ -106,7 +108,9 @@ OCI_SCOPE = "openid profile email offline_access groups get_groups"
 OCI_DEVICE_URL = f"{OCI_BASE}/oauth2/v1/device"
 OCI_TOKEN_URL = f"{OCI_BASE}/oauth2/v1/token"
 OCI_HEADERS_FORM = {"Content-Type": "application/x-www-form-urlencoded"}
-OCI_TOKEN_FILE = expanduser("~/.idcs_device_tokens.json")
+
+# 【修正箇所1】カレントディレクトリに保存するように変更
+OCI_TOKEN_FILE = ".idcs_device_tokens.json"
 
 def save_tokens(data) -> None:
     try:
@@ -122,6 +126,14 @@ def save_tokens(data) -> None:
         raise
 
 def load_tokens():
+    # 【修正箇所2】環境変数 AMD_TOKEN_JSON があれば最優先で読み込み
+    env_tokens = os.environ.get("AMD_TOKEN_JSON")
+    if env_tokens:
+        try:
+            return json.loads(env_tokens)
+        except Exception as e:
+            print("環境変数の読み込みエラー:", e)
+
     if not exists(OCI_TOKEN_FILE):
         return None
     try:
@@ -237,7 +249,11 @@ def ensure_tokens() -> dict:
         except Exception as e:
             print("トークンのリフレッシュが失敗しました。:", e)
 
-    # 新規認可
+    # 【修正箇所3】クラウド環境(Render)等で手動認証によってフリーズするのを防ぐ
+    if os.environ.get("RENDER") or os.environ.get("PORT"):
+        raise RuntimeError("クラウド環境での認証に失敗しました。Renderの環境変数 AMD_TOKEN_JSON を確認してください。")
+
+    # 新規認可 (ローカル環境でのみ実行される)
     dev = device_authorize()
     interval = int(dev.get("interval", 5))
     return poll_for_tokens(dev["device_code"], interval, int(dev["expires_in"]))
@@ -412,7 +428,7 @@ def xtll_extract(dh,tmd,lld,element):
     if len(lat) and lat[0] > lat[-1]:
         lat = lat[::-1]
         Met = Met[:,::-1,:]
-#    return tim,ma.masked_array(lat.values),ma.masked_array(lon.values),Met,name,unit
+#   return tim,ma.masked_array(lat.values),ma.masked_array(lon.values),Met,name,unit
     return tim,np.array(lat),np.array(lon),Met,name,unit
 
 def xll_extract(dh,lld,element):
@@ -432,7 +448,7 @@ def xll_extract(dh,lld,element):
     if len(lat) and lat[0] > lat[-1]:
         lat = lat[::-1]
         Met = Met[:,::-1,:]
-#    return ma.masked_array(lat.values),ma.masked_array(lon.values),Met,name,unit
+#   return ma.masked_array(lat.values),ma.masked_array(lon.values),Met,name,unit
     return np.array(lat),np.array(lon),Met,name,unit
 
 def xlatlon_fix(dhs, td, isArea=False):
@@ -657,7 +673,7 @@ class TimeDomain:
     def geogrid(self):
         a = (self.beg - TIMEZERO).days - 1
         b = (self.end - TIMEZERO).days + 1
-        return '"' + str(a) + '&lt;time","time&lt;'+ str(b) + '"'
+        return '"' + str(a) + '<time","time<'+ str(b) + '"'
 
     def isleap(self, year):
         return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
@@ -728,10 +744,10 @@ class TimeDomainHourly(TimeDomain):
             delta += td(hours=1)
         return dt(d.year, d.month, d.day, hour) + delta
 
-#    def geogrid(self):
-#        a = (self.beg - TIMEZERO).days * 24 + self.beg.hour - 1
-#        b = (self.end - TIMEZERO).days * 24 + self.end.hour + 1
-#        return '"' + str(a) + '&lt;time","time&lt;'+ str(b) + '"'
+#   def geogrid(self):
+#       a = (self.beg - TIMEZERO).days * 24 + self.beg.hour - 1
+#       b = (self.end - TIMEZERO).days * 24 + self.end.hour + 1
+#       return '"' + str(a) + '<time","time<'+ str(b) + '"'
 
     def isleap(self, year):
         return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
@@ -766,7 +782,7 @@ def add_stdtime(dh, dfile):
     dhに座標変数timeが存在し、かつ時刻の起点にtimezoneが存在したら
     座標変数をその地方標準時に挿げ替える
     dh: 取得したデータのDataArrayオブジェクト
-    dfile: NetCDFファイルへのパス　単に食べて出す(何もしない)
+    dfile: NetCDFファイルへのパス 単に食べて出す(何もしない)
     '''
     with Dataset(dfile) as nc:
         if 'time' in nc.variables:
@@ -874,7 +890,7 @@ def GetMetData_Area(element, timedomain, lalodomain, area=None,
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(Area区切り対応版)。
 書式：
-　GetMetData_Area(element, timedomain, lalodomain, area=None, cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
+ GetMetData_Area(element, timedomain, lalodomain, area=None, cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -897,7 +913,7 @@ def GetMetData_Area(element, timedomain, lalodomain, area=None,
                 一次元配列である。
     第3戻り値：切り出した気象データの緯度の並び。実数の一次元配列である。
     第4戻り値：切り出した気象データの経度の並び。実数の一次元配列である。
-　 第5戻り値(namuni=Trueのときのみ)：気象データの正式名称。文字列である。
+  第5戻り値(namuni=Trueのときのみ)：気象データの正式名称。文字列である。
     第6戻り値(namuni=Trueのときのみ)：気象データの単位。文字列である。
 使用例：北緯35度、東経135度の地点の2008年1月1日～2012年12月31日の日最高気温を取得する場合。
     import AMD_Tools4 as AMD
@@ -931,7 +947,7 @@ def GetMetData_Area(element, timedomain, lalodomain, area=None,
     for dhpath in dhpaths:
         StartUnlink(dhpath)
 
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
     tim,lat,lon,Met,name,unit = xtll_extract(dh,td,lld,element)
     if namuni:
         return Met, tim, lat, lon, name, unit
@@ -946,7 +962,7 @@ def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
 概要：
     気候予測シナリオデータを、データ配信サーバーまたはローカルファイルから取得する関数(Area区切り対応版)。
 書式：
-　GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS')
+ GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -969,10 +985,10 @@ def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
                 一次元配列である。
     第3戻り値：切り出した気象データの緯度の並び。実数の一次元配列である。
     第4戻り値：切り出した気象データの経度の並び。実数の一次元配列である。
-　 第5戻り値(namuni=Trueのときのみ)：気象データの正式名称。文字列である。
+  第5戻り値(namuni=Trueのときのみ)：気象データの正式名称。文字列である。
     第6戻り値(namuni=Trueのときのみ)：気象データの単位。文字列である。
 使用例：MIROC5モデルで予測したRCP8.5シナリオにおける、北緯35度、東経135度の地点の
-　　　2020年〜2030年の日最高気温を取得する場合。
+   2020年〜2030年の日最高気温を取得する場合。
     import AMD_Tools4 as AMD
     model  = 'MIROC5'
     scenario = 'RCP8.5'
@@ -1002,7 +1018,7 @@ def GetSceData_Area(element, timedomain, lalodomain, model, scenam, area=None,
     for dhpath in dhpaths:
         StartUnlink(dhpath)
         
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
     tim,lat,lon,Met,name,unit = xtll_extract(dh,td,lld,element)
     if namuni:
         return Met, tim, lat, lon, name, unit
@@ -1056,7 +1072,7 @@ def GetGeoData_Area(element, lalodomain, area=None,
     if dhpath is not None:
         StartUnlink(dhpath)
     
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
     lat,lon,Met,name,unit = xll_extract(dh,lld,element)
     if namuni:
         return Met, lat, lon, name, unit
@@ -1093,7 +1109,7 @@ def PutCSV_MT(Var, lat, lon, addlalo=False, header=None, filename='result.csv', 
     if len(Var.shape) == 2:     #2次元配列の場合は3次元配列にする。
 #        Var = np.ma.array(Var, ndmin=3)
         Var = np.array(Var, ndmin=3)
-    Var = np.where(Var == 9.96921E+36, np.nan, Var)  #NCLにおけるmissing　value
+    Var = np.where(Var == 9.96921E+36, np.nan, Var)  #NCLにおけるmissing value
     noti = Var.shape[0]
     nola = Var.shape[1]
     nolo = Var.shape[2]
@@ -1150,11 +1166,6 @@ def make_html(lon0, lat0, lon1, lat1, figs, colorbar, htmlfile, name):
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.2.0/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.2.0/dist/leaflet.js"></script>
 <style type="text/css">
-<!--
-input[type=range]::-ms-tooltip {
-    display: none;
-}
--->
 </style>
 </head>
 <body style="padding: 0; margin: 0; height: 100%; width: 100%;">
@@ -1309,7 +1320,7 @@ def PutGSI_Map(data, lat, lon, label=None, cmapstr=None, minmax=None, filename="
     outdir:出力フォルダ名
 カラーマップについて：
     カラーマップには名称があるのでこれを文字列で("で囲んで)指定する。
-    例)　レインボーカラー:rainbow、黄色-オレンジ-赤の順で変化:YlOrRdなど
+    例) レインボーカラー:rainbow、黄色-オレンジ-赤の順で変化:YlOrRdなど
     色の順序をを反転させたい場合は、rainbow_rのよう名称の後ろに"_r"を付加する。
     詳細は下記URLを参照。
         http://matplotlib.org/examples/color/colormaps_reference.html
@@ -1317,7 +1328,7 @@ def PutGSI_Map(data, lat, lon, label=None, cmapstr=None, minmax=None, filename="
     この関数は、numpy.datetime64[D]型(日時のを格納)の配列も表示することができるので、日付の
     分布図を描画できます。但し、等値色の塗り方はメッシュ単位ではなく、メッシュ中心点の値を等高線
     で結ぶような描画になります。
-　　　また、オプション引数minmaxで配色の下限と上限を指定する場合は、下記のようにして日付値を指定
+   また、オプション引数minmaxで配色の下限と上限を指定する場合は、下記のようにして日付値を指定
     してください(datetimeオブジェクトで指定すると誤作動します)。
     minmax = [np.datetime64('2018-08-25','D'),np.datetime64('2018-09-05','D')]
 
@@ -1364,7 +1375,7 @@ AMD.PutGSI_Map(dat,lat,lon,label=nam+" ["+uni+"]", cmapstr="rainbow",minmax=None
 def PutGeoTIFF(data, lat=None, lon=None, filename=None, meta=None, descriptions=None):
     """
     メッシュデータをGeoTIFF形式のファイルで出力する関数
-    　　内部で、get_metadata_geotiff を使用
+      内部で、get_metadata_geotiff を使用
     引数：
      data: ラスター化したい2次元[緯度,経度]または、3次元[層,緯度,経度]のndarray
      lat: 配列が従う緯度座標
@@ -1502,10 +1513,10 @@ def linefig(x, var, title='', xlabel='Date', ylabel='', llabel='',
     """
 概要：
     １次元配列のデータをシンプルな折れ線グラフとして可視化する関数
-    　・主線は太青・丸マーカ付き
-    　・参照線(細赤線)を追加できる
-    　・横軸は主線/参照線で共通にも独立にも設定できる
-    　・グラフタイトル、軸ラベル、データ凡例を付加できる
+     ・主線は太青・丸マーカ付き
+     ・参照線(細赤線)を追加できる
+     ・横軸は主線/参照線で共通にも独立にも設定できる
+     ・グラフタイトル、軸ラベル、データ凡例を付加できる
 引数(必須)：
       x： 折れ線グラフの横軸となる１次元配列
       var： 折れ線の値の１次元配列
@@ -1519,7 +1530,7 @@ def linefig(x, var, title='', xlabel='Date', ylabel='', llabel='',
       ylabelref: 参照の折れ線の縦軸ラベル
       llabelref: 参照の折れ線の凡例ラベル
       commony: commony=Falseとすると第２縦軸を用意する
-      figsize: 図の横,縦のサイズ　デフォルトでは横10縦3インチ
+      figsize: 図の横,縦のサイズ デフォルトでは横10縦3インチ
       filename: 図をpngファイルで保存したいときにファイル名を指定する
 戻り値：
       なし
@@ -1658,7 +1669,7 @@ def GetGeoData(element, lalodomain, namuni=False,
 
     #return m
 
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
         
     lat,lon,Met,name,unit = xll_extract(m,lld,element)
     
@@ -1719,7 +1730,7 @@ def GetMetData(element, timedomain, lalodomain,
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応)。
 書式：
-　GetMetData(element, timedomain, lalodomain, cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
+ GetMetData(element, timedomain, lalodomain, cli=False, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -1772,7 +1783,7 @@ def GetMetData(element, timedomain, lalodomain,
             StartUnlink(path)
     #return m
 
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
         
     tim,lat,lon,Met,name,unit = xtll_extract(m,td,lld,element)
         
@@ -1788,7 +1799,7 @@ def GetMetDataX(element, timedomain, lalodomain,
 概要：
     メッシュ農業気象データを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応, xarray出力版)。
 書式：
-　GetMetDataX(element, timedomain, lalodomain, cli=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
+ GetMetDataX(element, timedomain, lalodomain, cli=False, url='https://amd.rd.naro.go.jp/opendap/AMD')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -1836,7 +1847,7 @@ def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url
 概要：
     気候予測シナリオデータを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応版)。
 書式：
-　GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS')
+ GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMS')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -1861,7 +1872,7 @@ def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url
     第5戻り値(namuni=Trueのときのみ)：気象データの正式名称。文字列である。
     第6戻り値(namuni=Trueのときのみ)：気象データの単位。文字列である。
 使用例：MIROC5モデルで予測したRCP8.5シナリオにおける、北緯35度、東経135度の地点の
-　　　2020年〜2030年の日最高気温を取得する場合。
+   2020年〜2030年の日最高気温を取得する場合。
     import AMD_Tools4 as AMD
     model  = 'MIROC5'
     scenario = 'RCP8.5'
@@ -1892,7 +1903,7 @@ def GetSceData(element, timedomain, lalodomain, model, scenam, namuni=False, url
             StartUnlink(path)
     #return m
     
-    ## 従来からのnumpy 出力　
+    ## 従来からのnumpy 出力 
         
     tim,lat,lon,Met,name,unit = xtll_extract(m,td,lld,element)
         
@@ -1908,7 +1919,7 @@ def GetSceDataX(element, timedomain, lalodomain, model, scenam,
 概要：
     気候予測シナリオデータを、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(1次メッシュ区切り対応版, xarray出力版)。
 書式：
-　GetSceDataX(element, timedomain, lalodomain, model, scenam, url='https://amd.rd.naro.go.jp/opendap/AMS')
+ GetSceDataX(element, timedomain, lalodomain, model, scenam, url='https://amd.rd.naro.go.jp/opendap/AMS')
 引数(必須)：
     element：気象要素記号で、'TMP_mea'などの文字列で与える
     timedomain：取得するデータの時間範囲で、['2008-05-05', '2008-05-05']
@@ -1925,7 +1936,7 @@ def GetSceDataX(element, timedomain, lalodomain, model, scenam,
 戻り値：
     第１戻り値：xarray.DataArrayオブジェクト。（切り出した気象データ、時刻、緯度、経度、正式名称、単位を含む。）
 使用例：MIROC5モデルで予測したRCP8.5シナリオにおける、北緯35度、東経135度の地点の
-　　　2020年〜2030年の日最高気温を取得する場合。
+   2020年〜2030年の日最高気温を取得する場合。
     import AMD_Tools4 as AMD
     model  = 'MIROC5'
     scenario = 'RCP8.5'
@@ -1957,7 +1968,7 @@ def GetMetDataHourly(element, timedomain, lalodomain,
 概要：
     メッシュ農業気象データ時別値を、気象データをデータ配信サーバーまたはローカルファイルから取得する関数。
 書式：
-　GetMetDataHourly(element, timedomain, lalodomain, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly')
+ GetMetDataHourly(element, timedomain, lalodomain, namuni=False, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly')
 引数(必須)：
     element：気象要素記号で、'TMP'などの文字列で与える。（気温: 'TMP', 相対湿度: 'RH', 下向き長波放射量: 'DLR'）
     timedomain：取得するデータの時間範囲で、['2008-05-05T13:00', '2008-05-05']
@@ -2020,7 +2031,7 @@ def GetMetDataHourlyX(element, timedomain, lalodomain,
 概要：
     メッシュ農業気象データ時別値を、気象データをデータ配信サーバーまたはローカルファイルから取得する関数(xarray出力版)。
 書式：
-　GetMetDataHourlyX(element, timedomain, lalodomain, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly')
+ GetMetDataHourlyX(element, timedomain, lalodomain, url='https://amd.rd.naro.go.jp/opendap/AMD_Hourly')
 引数(必須)：
     element：気象要素記号で、'TMP'などの文字列で与える。（気温: 'TMP', 相対湿度: 'RH', 下向き長波放射量: 'DLR'）
     timedomain：取得するデータの時間範囲で、['2008-05-05T13:00', '2008-05-05']
@@ -2051,7 +2062,7 @@ def GetMetDataHourlyX(element, timedomain, lalodomain,
             opendap_source = urljoin([url,f'{year}',f'{ec}{element}',filename]) + '?dap4.ce=' + f'/time{tidx};' + f'/lat{cidx[0]};' + f'/lon{cidx[1]};' + f'/{element}{tidx}{cidx[0]}{cidx[1]}'
             dhh, dfh = url2dh(opendap_source)
             dh[code,year],dhpath[code,year] = add_stdtime(dhh, dfh)
-#            dh[code,year],dhpath[code,year] = url2dh(opendap_source)
+#           dh[code,year],dhpath[code,year] = url2dh(opendap_source)
 
     if len(dh.keys()) == 0:
         print("No data to retrieve. Please check lat-lon or time domain.")
