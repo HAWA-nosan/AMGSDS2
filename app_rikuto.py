@@ -4,7 +4,11 @@ from datetime import datetime, timedelta, date
 import pandas as pd
 import numpy as np
 import traceback
+import socket  # ★追加：通信をコントロールするための標準ライブラリ
 import AMD_Tools4 as amd
+
+# ★最強の安全装置：NAROサーバーからの返事が15秒来なければ、永遠に待たずに通信を強制切断する
+socket.setdefaulttimeout(15.0)
 
 app = Flask(__name__)
 
@@ -53,7 +57,7 @@ def get_climate_data():
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
             df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
             
-            # ★ ここを追加！過去3年平均を「小数点2桁」で丸める
+            # ★ 過去3年平均を「小数点2桁」で丸める
             df_avg["tave_avg"] = df_avg["tave_avg"].round(2)
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
