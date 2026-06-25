@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: amgsds-rikuto
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app_rikuto:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9
