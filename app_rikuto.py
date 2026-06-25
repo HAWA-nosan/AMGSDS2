@@ -4,15 +4,10 @@ from datetime import datetime, timedelta, date
 import pandas as pd
 import numpy as np
 import traceback
-import socket  # ★追加：通信をコントロールするための標準ライブラリ
 import AMD_Tools4 as amd
-
-# ★最強の安全装置：NAROサーバーからの返事が15秒来なければ、永遠に待たずに通信を強制切断する
-socket.setdefaulttimeout(60.0)
 
 app = Flask(__name__)
 
-# エラー時にJSONを返す安全装置
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
@@ -35,16 +30,13 @@ def get_climate_data():
         
         real_this_year = today.year if today.month >= 4 else today.year - 1
 
-        # --- ① 過去3年平均気温を算出 ---
+        # --- ① 過去3年平均気温を最速算出 ---
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start, end = f"{year}-04-01", f"{year+1}-03-31"
             try:
                 temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
-                df = pd.DataFrame({
-                    "datetime": pd.to_datetime(list(tim)),
-                    "tave": temp[:, 0, 0]
-                })
+                df = pd.DataFrame({"datetime": pd.to_datetime(list(tim)), "tave": temp[:, 0, 0]})
                 df["month_day"] = df["datetime"].dt.strftime("%m-%d")
                 all_years_data.append(df[["month_day", "tave"]])
             except Exception: pass
@@ -56,8 +48,6 @@ def get_climate_data():
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
             df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
-            
-            # ★ 過去3年平均を「小数点2桁」で丸める
             df_avg["tave_avg"] = df_avg["tave_avg"].round(2)
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
@@ -96,15 +86,12 @@ def get_climate_data():
             df_this = df_this.merge(df_avg, on="month_day", how="left")
             
             mask = df_this["tag"] == "normal"
-            
             df_this["tave_this"] = np.where(mask, df_this["tave_avg"], df_this["tave_real"])
             df_this["prcp_this"] = np.where(mask, 0.0, df_this["prcp_real"])
             
-            # P列の平均気温・降水量は1桁で統一
-            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1)
+            # ダミーデータへの強制変換を廃止し、取得できた正確なデータをそのまま使用
+            df_this["tave_this"] = df_this["tave_this"].round(1)
             df_this["prcp_this"] = df_this["prcp_this"].fillna(0.0).round(1)
-            
-            # 最高・最低気温は実測値(real)をそのまま使う
             df_this["tmax_this"] = df_this["tmax_real"].round(1)
             df_this["tmin_this"] = df_this["tmin_real"].round(1)
 
@@ -114,7 +101,7 @@ def get_climate_data():
         else:
             df_forecast = pd.DataFrame()
 
-        # --- ③ 積算処理 (B6～B7の期間のみ) ---
+        # --- ③ 積算処理 ---
         if not df_this.empty:
             mask_ct1 = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
             df_ct1 = df_this.loc[mask_ct1].copy().reset_index(drop=True)
@@ -129,7 +116,6 @@ def get_climate_data():
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
             
-            # 将来の雨量は積算しない
             mask_fut_rain = df_ct1["date"] > yesterday
             df_ct1.loc[mask_fut_rain, ["daily_pr", "cum_pr"]] = np.nan
 
@@ -147,7 +133,6 @@ def get_climate_data():
             else:
                 hist_dict = {"date": None, "cum_ct": None, "cum_pr": None}
 
-        # JSONの空欄（NaN）を空白文字に変換する処理
         def clean_json(data):
             if isinstance(data, list): return [clean_json(x) for x in data]
             if isinstance(data, dict): return {k: clean_json(v) for k, v in data.items()}
