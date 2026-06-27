@@ -112,32 +112,47 @@ OCI_HEADERS_FORM = {"Content-Type": "application/x-www-form-urlencoded"}
 # 【修正箇所1】カレントディレクトリに保存するように変更
 OCI_TOKEN_FILE = ".idcs_device_tokens.json"
 
+# ---------------------------------------------------------
+# 認証トークンのインメモリキャッシュ（クラウド競合・更新エラー対策）
+_cached_token = None
+
 def save_tokens(data) -> None:
-    """
-    【手順①】クラウド環境でのファイル書き込みを完全に禁止し、破壊を防ぐ
-    （複数プログラムによるファイルの同時書き換え・競合を防止します）
-    """
-    print("info: Token saving is disabled to prevent conflicts (Read-Only mode).")
-    return
+    global _cached_token
+    _cached_token = data  # 新しく取得したトークンをメモリ上に記憶
+    try:
+        # 念のためファイルにも書き込むが、エラーになっても無視する
+        with open(OCI_TOKEN_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass 
 
 def load_tokens():
-    """
-    【手順③】環境変数からトークン情報を直接取得する
-    （ローカルファイルは見に行かず、Renderの設定値のみを信じます）
-    """
+    global _cached_token
+    # 1. すでにメモリ上に最新トークンがあれば、絶対にそれを使う（最優先）
+    if _cached_token is not None:
+        return _cached_token
+        
+    # 2. 最初は環境変数 AMD_TOKEN_JSON から読み込む
     env_tokens = os.environ.get("AMD_TOKEN_JSON")
-    
     if env_tokens:
         try:
-            # 環境変数の中身（文字列）をJSONとして読み込む
-            return json.loads(env_tokens)
+            _cached_token = json.loads(env_tokens)
+            return _cached_token
         except Exception as e:
             print(f"Error parsing AMD_TOKEN_JSON: {e}")
-            return None
     
-    # 環境変数が設定されていない場合は、無理にファイルを探さず None を返す
-    print("Warning: AMD_TOKEN_JSON is not set in environment variables.")
+    # 3. 最後の手段としてローカルファイルを探す
+    from os.path import exists
+    if exists(OCI_TOKEN_FILE):
+        try:
+            with open(OCI_TOKEN_FILE) as f:
+                _cached_token = json.load(f)
+                return _cached_token
+        except Exception:
+            pass
+            
     return None
+# ---------------------------------------------------------
 
 def is_access_token_valid(tokens, skew = 30):
     if not tokens or "access_token" not in tokens or "expires_in" not in tokens or "obtained_at" not in tokens:
