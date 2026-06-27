@@ -26,7 +26,7 @@ AMD_Tools4.py
     20260224 GetMetDataHourly、GetMetDataHourlyX関数のバグを修正
     20260216 新認証に対応
     20260625 クラウド(Render)環境での環境変数認証・自動ログインに対応
-     Copyright (C)  OHNO, Hiroyuki
+      Copyright (C)  OHNO, Hiroyuki
 """
 #_ プロキシーサーバー経由で接続する方は下も設定してください。______
 # （使用しない場合はこのままにしてください）
@@ -113,35 +113,31 @@ OCI_HEADERS_FORM = {"Content-Type": "application/x-www-form-urlencoded"}
 OCI_TOKEN_FILE = ".idcs_device_tokens.json"
 
 def save_tokens(data) -> None:
-    try:
-        with open(OCI_TOKEN_FILE, "w") as f:
-            json.dump({
-                "access_token": data.get("access_token"),
-                "refresh_token": data.get("refresh_token"),
-                "expires_in": data.get("expires_in"),
-                "obtained_at": int(time.time())
-            }, f)
-    except Exception as e:
-        print(f'トークンファイルを保存できませんでした。{abspath(OCI_TOKEN_FILE)}に書き込めるか確認してください。')
-        raise
+    """
+    【手順①】クラウド環境でのファイル書き込みを完全に禁止し、破壊を防ぐ
+    （複数プログラムによるファイルの同時書き換え・競合を防止します）
+    """
+    print("info: Token saving is disabled to prevent conflicts (Read-Only mode).")
+    return
 
 def load_tokens():
-    # 【修正箇所2】環境変数 AMD_TOKEN_JSON があれば最優先で読み込み
+    """
+    【手順③】環境変数からトークン情報を直接取得する
+    （ローカルファイルは見に行かず、Renderの設定値のみを信じます）
+    """
     env_tokens = os.environ.get("AMD_TOKEN_JSON")
+    
     if env_tokens:
         try:
+            # 環境変数の中身（文字列）をJSONとして読み込む
             return json.loads(env_tokens)
         except Exception as e:
-            print("環境変数の読み込みエラー:", e)
-
-    if not exists(OCI_TOKEN_FILE):
-        return None
-    try:
-        with open(OCI_TOKEN_FILE) as f:
-            return json.load(f)
-    except Exception as e:
-        print(f'トークンファイルを開けませんでした。{abspath(OCI_TOKEN_FILE)}を確認してください。')
-        raise
+            print(f"Error parsing AMD_TOKEN_JSON: {e}")
+            return None
+    
+    # 環境変数が設定されていない場合は、無理にファイルを探さず None を返す
+    print("Warning: AMD_TOKEN_JSON is not set in environment variables.")
+    return None
 
 def is_access_token_valid(tokens, skew = 30):
     if not tokens or "access_token" not in tokens or "expires_in" not in tokens or "obtained_at" not in tokens:
@@ -2085,7 +2081,7 @@ def main():
     parser.add_argument('-v', '--version', action='version', version='%(prog)s 4.1.1')
     args = parser.parse_args()
     
-    #引数を何も与えない場合    
+    #引数を何も与えない場合   
     if not any(vars(args).values()):
         parser.print_help()
 
