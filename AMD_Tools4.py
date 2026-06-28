@@ -229,12 +229,11 @@ def poll_for_tokens(device_code: str, interval: int, expires_in: int) -> dict:
                 raise
         time.sleep(wait)
 
-
 def refresh_access_token(refresh_token):
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": OCI_CLIENT_ID,  # client_secret 不要（クライアントの設定次第）
+        "client_id": OCI_CLIENT_ID,
     }
     try:
         req = urllib.request.Request(OCI_TOKEN_URL, urllib.parse.urlencode(payload).encode('utf-8'), OCI_HEADERS_FORM)
@@ -242,11 +241,18 @@ def refresh_access_token(refresh_token):
             data = json.load(res)
             data["obtained_at"] = int(time.time())
             save_tokens(data)
-            print(">>> アクセストークンをリフレッシュしました")
+            print(">>> アクセストークンを自動リフレッシュしました")
             return data
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        print('トークンのリフレッシュができませんでした。')
-        raise
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            print(">>> 【重要】リフレッシュトークンの寿命が尽きました。PCでの再認証が必要です。")
+            # これ以上NAROに無駄なアタックをしてスパムになるのを防ぐため、メモリの記憶を消去
+            global _cached_token
+            if _cached_token and "refresh_token" in _cached_token:
+                _cached_token["refresh_token"] = None
+        else:
+            print(f">>> トークンリフレッシュエラー: {e.code}")
+        raise # 失敗した場合は確実にエラーとして上に伝える
 
 def ensure_tokens() -> dict:
     """ 有効なATを返す。なければデバイスフロー、期限切れならRTで更新 """
@@ -257,14 +263,18 @@ def ensure_tokens() -> dict:
     if tokens and tokens.get("refresh_token"):
         try:
             return refresh_access_token(tokens["refresh_token"])
-        except Exception as e:
-            print("トークンのリフレッシュが失敗しました。:", e)
+        except Exception:
+            # リフレッシュ失敗時はそのまま下のクラウド環境エラーへ流す
+            pass
 
-    # 【修正箇所3】クラウド環境(Render)等で手動認証によってフリーズするのを防ぐ
     if os.environ.get("RENDER") or os.environ.get("PORT"):
-        raise RuntimeError("クラウド環境での認証に失敗しました。Renderの環境変数 AMD_TOKEN_JSON を確認してください。")
+        # クラウド上でトークンが死んだ場合は、フリーズを防ぐため明確に例外を投げる
+        raise RuntimeError(
+            "【要対応】Render上の認証キーが完全に失効しました。\n"
+            "PCで renew_token.py を実行し、取得した新しいJSONをRenderの AMD_TOKEN_JSON に上書きしてください。"
+        )
 
-    # 新規認可 (ローカル環境でのみ実行される)
+    # 新規認可 (ローカルPC環境でのみ実行される)
     dev = device_authorize()
     interval = int(dev.get("interval", 5))
     return poll_for_tokens(dev["device_code"], interval, int(dev["expires_in"]))
