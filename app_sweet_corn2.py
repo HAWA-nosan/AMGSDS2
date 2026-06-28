@@ -60,17 +60,29 @@ def parse_request_payload(d: dict) -> dict:
         "ceiling_threshold2": parse_float(d.get("ceiling_threshold2"), allow_none=True), "gdd2_target": parse_float(d.get("gdd2_target", 0)),
     }
 
-# ★爆速化：まとめて数年分のデータを1回で取得する
-@lru_cache(maxsize=64)
-def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
+# -----------------------------------------------------
+# ★変更：約1kmのメッシュ単位で同一視してキャッシュ（記憶）する
+@lru_cache(maxsize=1024) # メモリ枠を大幅に拡大（200シートでも余裕で記憶）
+def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
     try:
-        arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [lat, lat, lon, lon])
+        arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
         values = arr[:, 0, 0]
         s_dates = pd.to_datetime(pd.Series(list(tim)))
         dates = s_dates.dt.normalize().dt.date.tolist()
         return dates, list(values)
     except Exception:
         return [], []
+
+def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
+    # 1. 入力された緯度経度から「3次メッシュコード（約1km四方）」を計算
+    mesh_code = amd.lalo2mesh(lat, lon)
+    
+    # 2. そのメッシュの中心座標を取得（同じメッシュなら常に同じ座標になる）
+    center_lat, center_lon = amd.mesh2lalo(mesh_code)
+    
+    # 3. メッシュコードをキーにしてキャッシュ付き関数を呼び出す
+    return _cached_fetch(var_name, start_date, end_date, mesh_code, center_lat, center_lon)
+# -----------------------------------------------------
 
 def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years: int = 3) -> pd.DataFrame:
     start_avg, end_avg = f"{fiscal_year - n_years}-04-01", f"{fiscal_year}-03-31"
