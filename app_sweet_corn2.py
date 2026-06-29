@@ -22,6 +22,12 @@ DL_CSV_PATH = Path(__file__).resolve().parent / "sweetcorn_data-DL.csv"
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
+# ★追加：GASからの「生存確認（スリープ防止）」に応答するルート
+@app.route("/", methods=["GET"])
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "OK Server is awake!", 200
+
 def to_date(s: str) -> date:
     if not s: return None
     return datetime.fromisoformat(s).date()
@@ -61,26 +67,19 @@ def parse_request_payload(d: dict) -> dict:
     }
 
 # -----------------------------------------------------
-# ★変更：約1kmのメッシュ単位で同一視してキャッシュ（記憶）する
-@lru_cache(maxsize=1024) # メモリ枠を大幅に拡大（200シートでも余裕で記憶）
+# ★変更：エラーをごまかさず、確実にストップさせる防弾仕様
+@lru_cache(maxsize=1024)
 def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
-    try:
-        arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
-        values = arr[:, 0, 0]
-        s_dates = pd.to_datetime(pd.Series(list(tim)))
-        dates = s_dates.dt.normalize().dt.date.tolist()
-        return dates, list(values)
-    except Exception:
-        return [], []
+    # try-exceptを外し、通信失敗やトークン切れの際は明確にエラーを発生させ、スプレッドシートの空書き込みを防ぎます。
+    arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
+    values = arr[:, 0, 0]
+    s_dates = pd.to_datetime(pd.Series(list(tim)))
+    dates = s_dates.dt.normalize().dt.date.tolist()
+    return dates, list(values)
 
 def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
-    # 1. 入力された緯度経度から「3次メッシュコード（約1km四方）」を計算
     mesh_code = amd.lalo2mesh(lat, lon)
-    
-    # 2. そのメッシュの中心座標を取得（同じメッシュなら常に同じ座標になる）
     center_lat, center_lon = amd.mesh2lalo(mesh_code)
-    
-    # 3. メッシュコードをキーにしてキャッシュ付き関数を呼び出す
     return _cached_fetch(var_name, start_date, end_date, mesh_code, center_lat, center_lon)
 # -----------------------------------------------------
 
@@ -113,7 +112,6 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
     yesterday, forecast_end = today - timedelta(days=1), today + timedelta(days=26)
     df["tag"] = df["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
 
-    # 過去と今年のデータをまとめて1回で取得
     s_real, e_real = f"{fiscal_year-1}-04-01", f"{fiscal_year+1}-03-31"
     dates, tmean = fetch_point_series_bulk("TMP_mea", s_real, e_real, lat, lon)
     _, tmax = fetch_point_series_bulk("TMP_max", s_real, e_real, lat, lon)
@@ -276,6 +274,7 @@ def get_climate_data():
             "ct1_until_yesterday": hist_dict1, "ct2_until_yesterday": hist_dict2
         }))
     except Exception as e:
+        # ここで例外が発生するとステータス400を返し、GAS側がシートの更新を安全にスキップします。
         return jsonify({"status": "error", "message": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
