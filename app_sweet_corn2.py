@@ -22,7 +22,7 @@ DL_CSV_PATH = Path(__file__).resolve().parent / "sweetcorn_data-DL.csv"
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
-# ★追加：GASからの「生存確認（スリープ防止）」に応答するルート
+# ★GASからの「生存確認（スリープ防止）」に応答するルート
 @app.route("/", methods=["GET"])
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -67,10 +67,10 @@ def parse_request_payload(d: dict) -> dict:
     }
 
 # -----------------------------------------------------
-# ★変更：エラーをごまかさず、確実にストップさせる防弾仕様
+# ★約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
 @lru_cache(maxsize=1024)
 def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
-    # try-exceptを外し、通信失敗やトークン切れの際は明確にエラーを発生させ、スプレッドシートの空書き込みを防ぎます。
+    # try-exceptを排除：通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
     arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
     values = arr[:, 0, 0]
     s_dates = pd.to_datetime(pd.Series(list(tim)))
@@ -274,7 +274,7 @@ def get_climate_data():
             "ct1_until_yesterday": hist_dict1, "ct2_until_yesterday": hist_dict2
         }))
     except Exception as e:
-        # ここで例外が発生するとステータス400を返し、GAS側がシートの更新を安全にスキップします。
+        # ★エラー時は400を返し、シートへの空データ上書きを確実に防ぎます
         return jsonify({"status": "error", "message": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
