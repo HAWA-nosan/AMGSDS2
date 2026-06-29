@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, date
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 import traceback
-import AMD_Tools4 as amd
+
+try:
+    import AMD_Tools4 as amd
+except ImportError:
+    amd = None
 
 app = Flask(__name__)
 
@@ -12,6 +17,29 @@ app = Flask(__name__)
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
+
+# ★GASからの「生存確認（スリープ防止）」に応答するルート
+@app.route("/", methods=["GET"])
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "OK Server is awake!", 200
+
+# -----------------------------------------------------
+# ★約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
+@lru_cache(maxsize=1024)
+def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
+    # try-exceptを排除：通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
+    arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
+    values = arr[:, 0, 0]
+    s_dates = pd.to_datetime(pd.Series(list(tim)))
+    dates = s_dates.dt.normalize().dt.date.tolist()
+    return dates, list(values)
+
+def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: float, lon: float):
+    mesh_code = amd.lalo2mesh(lat, lon)
+    center_lat, center_lon = amd.mesh2lalo(mesh_code)
+    return _cached_fetch(var_name, start_date, end_date, mesh_code, center_lat, center_lon)
+# -----------------------------------------------------
 
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
@@ -35,15 +63,15 @@ def get_climate_data():
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start, end = f"{year}-04-01", f"{year+1}-03-31"
-            try:
-                temp, tim, *_ = amd.GetMetData("TMP_mea", [start, end], [lat, lat, lon, lon])
+            # キャッシュ機能を使って取得
+            dates, tmean = fetch_point_series_bulk("TMP_mea", start, end, lat, lon)
+            if dates:
                 df = pd.DataFrame({
-                    "datetime": pd.to_datetime(list(tim)),
-                    "tave": temp[:, 0, 0]
+                    "datetime": pd.to_datetime(dates),
+                    "tave": tmean
                 })
                 df["month_day"] = df["datetime"].dt.strftime("%m-%d")
                 all_years_data.append(df[["month_day", "tave"]])
-            except Exception: pass
 
         if all_years_data:
             df_avg = pd.concat(all_years_data).groupby("month_day", as_index=False).mean()
@@ -63,28 +91,27 @@ def get_climate_data():
         
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
         
-        # ★ 修正ポイント：農研機構への「実測値」のリクエストは「昨日」までに制限する
         fetch_start = start_this
         fetch_end = min(end_this, yesterday)
         
         df_api = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
         
         if fetch_start <= fetch_end:
-            try:
-                sy, ey = fetch_start.strftime("%Y-%m-%d"), fetch_end.strftime("%Y-%m-%d")
-                temp_this, tim_this, *_ = amd.GetMetData("TMP_mea", [sy, ey], [lat, lat, lon, lon])
-                tmax_this, _, *_        = amd.GetMetData("TMP_max", [sy, ey], [lat, lat, lon, lon])
-                tmin_this, _, *_        = amd.GetMetData("TMP_min", [sy, ey], [lat, lat, lon, lon])
-                prcp_this, _, *_        = amd.GetMetData("APCPRA",  [sy, ey], [lat, lat, lon, lon])
+            sy, ey = fetch_start.strftime("%Y-%m-%d"), fetch_end.strftime("%Y-%m-%d")
+            # キャッシュ機能を使って一括取得
+            dates, temp_this = fetch_point_series_bulk("TMP_mea", sy, ey, lat, lon)
+            _, tmax_this     = fetch_point_series_bulk("TMP_max", sy, ey, lat, lon)
+            _, tmin_this     = fetch_point_series_bulk("TMP_min", sy, ey, lat, lon)
+            _, prcp_this     = fetch_point_series_bulk("APCPRA",  sy, ey, lat, lon)
+            
+            if dates:
                 df_api = pd.DataFrame({
-                    "date"      : pd.to_datetime(list(tim_this)).date,
-                    "tave_real" : temp_this[:, 0, 0], 
-                    "tmax_real" : tmax_this[:, 0, 0], 
-                    "tmin_real" : tmin_this[:, 0, 0], 
-                    "prcp_real" : prcp_this[:, 0, 0]
+                    "date"      : dates,
+                    "tave_real" : temp_this, 
+                    "tmax_real" : tmax_this, 
+                    "tmin_real" : tmin_this, 
+                    "prcp_real" : prcp_this
                 })    
-            except Exception as e:
-                print("API Fetch Error:", e)
 
         df_this = df_this.merge(df_api, on="date", how="left")
 
@@ -98,9 +125,8 @@ def get_climate_data():
             df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
             df_this = df_this.merge(df_avg, on="month_day", how="left")
             
-            # ★ 修正ポイント：実測値があれば使い、無い部分（未来）は過去3年平均値（tave_avg）で埋める
             df_this["tave_this"] = df_this["tave_real"].fillna(df_this["tave_avg"])
-            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1) # 最終安全装置
+            df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1) 
             
             df_this["prcp_this"] = df_this["prcp_real"].fillna(0.0).round(1)
             
@@ -159,6 +185,7 @@ def get_climate_data():
         }))
 
     except Exception as e:
+        # ★エラー時は400を返し、シートへの空データ上書きを確実に防ぎます
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
