@@ -5,6 +5,7 @@ from functools import lru_cache
 import pandas as pd
 import numpy as np
 import traceback
+import os
 
 try:
     import AMD_Tools4 as amd
@@ -18,17 +19,16 @@ app = Flask(__name__)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
-# ★GASからの「生存確認（スリープ防止）」に応答するルート
+# GASからの「生存確認（スリープ防止）」に応答するルート
 @app.route("/", methods=["GET"])
 @app.route("/ping", methods=["GET"])
 def ping():
     return "OK Server is awake!", 200
 
-# -----------------------------------------------------
-# ★約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
+# 約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
 @lru_cache(maxsize=1024)
 def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
-    # try-exceptを排除：通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
+    # 通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
     arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
     values = arr[:, 0, 0]
     s_dates = pd.to_datetime(pd.Series(list(tim)))
@@ -39,12 +39,17 @@ def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: 
     mesh_code = amd.lalo2mesh(lat, lon)
     center_lat, center_lon = amd.mesh2lalo(mesh_code)
     return _cached_fetch(var_name, start_date, end_date, mesh_code, center_lat, center_lon)
-# -----------------------------------------------------
 
 @app.route("/get_temp", methods=["POST"])
 def get_climate_data():
     try:
         d = request.get_json()
+        
+        # 🚀【トークン金庫化①】GASから渡されたトークンをシステム変数に一時セット
+        incoming_token = d.get("amd_token")
+        if incoming_token:
+            os.environ["AMD_TOKEN_JSON"] = incoming_token
+
         lat, lon = float(d["lat"]), float(d["lon"])
         threshold = float(d["threshold"])
         gdd1_target = float(d["gdd1"])
@@ -63,7 +68,6 @@ def get_climate_data():
         all_years_data = []
         for year in range(real_this_year - 3, real_this_year):
             start, end = f"{year}-04-01", f"{year+1}-03-31"
-            # キャッシュ機能を使って取得
             dates, tmean = fetch_point_series_bulk("TMP_mea", start, end, lat, lon)
             if dates:
                 df = pd.DataFrame({
@@ -98,7 +102,6 @@ def get_climate_data():
         
         if fetch_start <= fetch_end:
             sy, ey = fetch_start.strftime("%Y-%m-%d"), fetch_end.strftime("%Y-%m-%d")
-            # キャッシュ機能を使って一括取得
             dates, temp_this = fetch_point_series_bulk("TMP_mea", sy, ey, lat, lon)
             _, tmax_this     = fetch_point_series_bulk("TMP_max", sy, ey, lat, lon)
             _, tmin_this     = fetch_point_series_bulk("TMP_min", sy, ey, lat, lon)
@@ -178,14 +181,17 @@ def get_climate_data():
             if isinstance(data, (date, datetime)): return data.isoformat()
             return data
                 
+        # 🚀【トークン金庫化②】最新のトークンをシステム変数から取り出してGASへ送り返す
+        outgoing_token = os.environ.get("AMD_TOKEN_JSON", "")
+                
         return jsonify(clean_json({
             "average": df_avg.to_dict(orient="records"), "this_year": df_this.to_dict(orient="records"),
             "ct1": df_ct1.to_dict(orient="records"), "gdd1_target": closest_dict,
-            "gdd1_target_corr": corrected_dict, "ct1_until_yesterday": hist_dict, "forecast": df_forecast.to_dict(orient="records")
+            "gdd1_target_corr": corrected_dict, "ct1_until_yesterday": hist_dict, "forecast": df_forecast.to_dict(orient="records"),
+            "updated_token": outgoing_token  # ★追加
         }))
 
     except Exception as e:
-        # ★エラー時は400を返し、シートへの空データ上書きを確実に防ぎます
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
