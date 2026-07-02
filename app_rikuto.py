@@ -14,21 +14,17 @@ except ImportError:
 
 app = Flask(__name__)
 
-# エラー時にJSONを返す安全装置
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
-# GASからの「生存確認（スリープ防止）」に応答するルート
 @app.route("/", methods=["GET"])
 @app.route("/ping", methods=["GET"])
 def ping():
     return "OK Server is awake!", 200
 
-# 約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
 @lru_cache(maxsize=1024)
 def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
-    # 通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
     arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
     values = arr[:, 0, 0]
     s_dates = pd.to_datetime(pd.Series(list(tim)))
@@ -45,7 +41,7 @@ def get_climate_data():
     try:
         d = request.get_json()
         
-        # 🚀【トークン金庫化①】GASから渡されたトークンをシステム変数に一時セット
+        # GASの金庫から届いたトークンを環境変数に一時セット
         incoming_token = d.get("amd_token")
         if incoming_token:
             os.environ["AMD_TOKEN_JSON"] = incoming_token
@@ -70,10 +66,7 @@ def get_climate_data():
             start, end = f"{year}-04-01", f"{year+1}-03-31"
             dates, tmean = fetch_point_series_bulk("TMP_mea", start, end, lat, lon)
             if dates:
-                df = pd.DataFrame({
-                    "datetime": pd.to_datetime(dates),
-                    "tave": tmean
-                })
+                df = pd.DataFrame({"datetime": pd.to_datetime(dates), "tave": tmean})
                 df["month_day"] = df["datetime"].dt.strftime("%m-%d")
                 all_years_data.append(df[["month_day", "tave"]])
 
@@ -84,7 +77,6 @@ def get_climate_data():
             start_idx = df_avg[df_avg["month_day"] == "04-01"].index[0]
             df_avg = pd.concat([df_avg.iloc[start_idx:], df_avg.iloc[:start_idx]]).drop(columns=["sort_key"]).reset_index(drop=True)
             df_avg.rename(columns={"tave":"tave_avg"}, inplace=True)
-            
             df_avg["tave_avg"] = df_avg["tave_avg"].round(2)
         else:
             df_avg = pd.DataFrame(columns=["month_day", "tave_avg"])
@@ -92,12 +84,10 @@ def get_climate_data():
         # --- ② 対象期間の実測値取得 ---
         start_this = ct1_start
         end_this = max(ct1_end, forecast_end)
-        
         df_this = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
         
         fetch_start = start_this
         fetch_end = min(end_this, yesterday)
-        
         df_api = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
         
         if fetch_start <= fetch_end:
@@ -106,7 +96,6 @@ def get_climate_data():
             _, tmax_this     = fetch_point_series_bulk("TMP_max", sy, ey, lat, lon)
             _, tmin_this     = fetch_point_series_bulk("TMP_min", sy, ey, lat, lon)
             _, prcp_this     = fetch_point_series_bulk("APCPRA",  sy, ey, lat, lon)
-            
             if dates:
                 df_api = pd.DataFrame({
                     "date"      : dates,
@@ -127,22 +116,18 @@ def get_climate_data():
             df_this["tag"] = df_this["date"].map(assign_tag)
             df_this["month_day"] = pd.to_datetime(df_this["date"]).dt.strftime("%m-%d")
             df_this = df_this.merge(df_avg, on="month_day", how="left")
-            
             df_this["tave_this"] = df_this["tave_real"].fillna(df_this["tave_avg"])
             df_this["tave_this"] = df_this["tave_this"].fillna(10.0).round(1) 
-            
             df_this["prcp_this"] = df_this["prcp_real"].fillna(0.0).round(1)
-            
             df_this["tmax_this"] = df_this["tmax_real"].round(1)
             df_this["tmin_this"] = df_this["tmin_real"].round(1)
-
             df_this.drop(columns=["month_day", "tave_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
             df_forecast = df_this.loc[df_this["tag"] == "forecast"].copy().reset_index(drop=True)
             df_forecast["date"] = df_forecast["date"].map(lambda d: d.isoformat())
         else:
             df_forecast = pd.DataFrame()
 
-        # --- ③ 積算処理 (B6～B7の期間のみ) ---
+        # --- ③ 積算処理 (B6〜B7の期間のみ) ---
         if not df_this.empty:
             mask_ct1 = (df_this["date"] >= ct1_start) & (df_this["date"] <= ct1_end)
             df_ct1 = df_this.loc[mask_ct1].copy().reset_index(drop=True)
@@ -156,7 +141,6 @@ def get_climate_data():
             df_ct1["cum_ct"] = df_ct1["daily_ct"].cumsum().round(1)
             df_ct1["daily_pr"] = df_ct1["prcp_this"].round(1)
             df_ct1["cum_pr"] = df_ct1["daily_pr"].cumsum().round(1)
-            
             mask_fut_rain = df_ct1["date"] > yesterday
             df_ct1.loc[mask_fut_rain, ["daily_pr", "cum_pr"]] = np.nan
 
@@ -180,15 +164,14 @@ def get_climate_data():
             if pd.isna(data): return "" 
             if isinstance(data, (date, datetime)): return data.isoformat()
             return data
-                
-        # 🚀【トークン金庫化②】最新のトークンをシステム変数から取り出してGASへ送り返す
+
         outgoing_token = os.environ.get("AMD_TOKEN_JSON", "")
                 
         return jsonify(clean_json({
             "average": df_avg.to_dict(orient="records"), "this_year": df_this.to_dict(orient="records"),
             "ct1": df_ct1.to_dict(orient="records"), "gdd1_target": closest_dict,
             "gdd1_target_corr": corrected_dict, "ct1_until_yesterday": hist_dict, "forecast": df_forecast.to_dict(orient="records"),
-            "updated_token": outgoing_token  # ★追加
+            "updated_token": outgoing_token
         }))
 
     except Exception as e:
