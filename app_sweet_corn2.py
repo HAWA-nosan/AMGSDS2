@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import math
 import traceback
+import os
 
 try:
     import AMD_Tools4 as amd
@@ -22,7 +23,6 @@ DL_CSV_PATH = Path(__file__).resolve().parent / "sweetcorn_data-DL.csv"
 def handle_exception(e):
     return jsonify({"status": "error", "message": "Server Crash", "trace": traceback.format_exc()}), 500
 
-# ★GASからの「生存確認（スリープ防止）」に応答するルート
 @app.route("/", methods=["GET"])
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -30,7 +30,7 @@ def ping():
 
 def to_date(s: str) -> date:
     if not s: return None
-    return datetime.fromisoformat(s).date()
+    return datetime.fromisoformat(s).date() cleavage
 
 def parse_float(value, allow_none=False):
     if value is None or value == "": return None if allow_none else 0.0
@@ -66,11 +66,8 @@ def parse_request_payload(d: dict) -> dict:
         "ceiling_threshold2": parse_float(d.get("ceiling_threshold2"), allow_none=True), "gdd2_target": parse_float(d.get("gdd2_target", 0)),
     }
 
-# -----------------------------------------------------
-# ★約1kmのメッシュ単位で同一視してキャッシュ（記憶）する防弾仕様
 @lru_cache(maxsize=1024)
 def _cached_fetch(var_name: str, start_date: str, end_date: str, mesh_code: str, center_lat: float, center_lon: float):
-    # try-exceptを排除：通信失敗やトークン切れの際は明確にエラーを発生させ、シート破壊を防ぐ
     arr, tim, *_ = amd.GetMetData(var_name, [start_date, end_date], [center_lat, center_lat, center_lon, center_lon])
     values = arr[:, 0, 0]
     s_dates = pd.to_datetime(pd.Series(list(tim)))
@@ -81,22 +78,18 @@ def fetch_point_series_bulk(var_name: str, start_date: str, end_date: str, lat: 
     mesh_code = amd.lalo2mesh(lat, lon)
     center_lat, center_lon = amd.mesh2lalo(mesh_code)
     return _cached_fetch(var_name, start_date, end_date, mesh_code, center_lat, center_lon)
-# -----------------------------------------------------
 
 def build_average_temperature(lat: float, lon: float, fiscal_year: int, n_years: int = 3) -> pd.DataFrame:
     start_avg, end_avg = f"{fiscal_year - n_years}-04-01", f"{fiscal_year}-03-31"
     dates, tmean = fetch_point_series_bulk("TMP_mea", start_avg, end_avg, lat, lon)
     _, tmax = fetch_point_series_bulk("TMP_max", start_avg, end_avg, lat, lon)
     _, tmin = fetch_point_series_bulk("TMP_min", start_avg, end_avg, lat, lon)
-    
     if not dates: return pd.DataFrame(columns=["month_day", "tave_avg", "tmax_avg", "tmin_avg"])
-    
     df = pd.DataFrame({"datetime": pd.to_datetime(dates), "tave": tmean, "tmax": tmax, "tmin": tmin})
     df["month_day"] = df["datetime"].dt.strftime("%m-%d")
     df_avg = df.groupby("month_day", as_index=False).mean()
     df_avg.rename(columns={"tave": "tave_avg", "tmax": "tmax_avg", "tmin": "tmin_avg"}, inplace=True)
     df_avg["tave_avg"], df_avg["tmax_avg"], df_avg["tmin_avg"] = df_avg["tave_avg"].round(1), df_avg["tmax_avg"].round(1), df_avg["tmin_avg"].round(1)
-
     df_avg["sort_key"] = pd.to_datetime("2000-" + df_avg["month_day"])
     df_avg = df_avg.sort_values("sort_key").reset_index(drop=True)
     idx_m = df_avg.index[df_avg["month_day"] == "04-01"]
@@ -108,43 +101,34 @@ def build_this_year_dataframe(lat: float, lon: float, fiscal_year: int, today: d
     start_this = pd.to_datetime(f"{fiscal_year}-04-01").date()
     end_this = pd.to_datetime(f"{fiscal_year + 1}-03-31").date()
     df = pd.DataFrame({"date": pd.date_range(start=start_this, end=end_this).date})
-
     yesterday, forecast_end = today - timedelta(days=1), today + timedelta(days=26)
     df["tag"] = df["date"].apply(lambda d: "past" if d <= yesterday else ("forecast" if d <= forecast_end else "normal"))
-
     s_real, e_real = f"{fiscal_year-1}-04-01", f"{fiscal_year+1}-03-31"
     dates, tmean = fetch_point_series_bulk("TMP_mea", s_real, e_real, lat, lon)
     _, tmax = fetch_point_series_bulk("TMP_max", s_real, e_real, lat, lon)
     _, tmin = fetch_point_series_bulk("TMP_min", s_real, e_real, lat, lon)
     _, prcp = fetch_point_series_bulk("APCPRA", s_real, e_real, lat, lon)
-    
     if dates:
         df_avail = pd.DataFrame({"date": dates, "tave_real": tmean, "tmax_real": tmax, "tmin_real": tmin, "prcp_real": prcp})
         df_avail = df_avail.drop_duplicates(subset=["date"], keep="last")
     else:
         df_avail = pd.DataFrame(columns=["date", "tave_real", "tmax_real", "tmin_real", "prcp_real"])
-
     df["date_ts"] = pd.to_datetime(df["date"])
     df_avail["date_ts"] = pd.to_datetime(df_avail["date"])
     df = df.merge(df_avail.drop(columns=["date"]), left_on="date_ts", right_on="date_ts", how="left")
-    
     df["month_day"] = df["date_ts"].dt.strftime("%m-%d")
-    
     if not df_avg.empty:
         df = df.merge(df_avg[["month_day", "tave_avg", "tmax_avg", "tmin_avg"]], on="month_day", how="left")
     else:
         df["tave_avg"], df["tmax_avg"], df["tmin_avg"] = 10.0, 14.0, 6.0
-
     mask_normal = df["tag"] == "normal"
     for col, avg_col in [("tave", "tave_avg"), ("tmax", "tmax_avg"), ("tmin", "tmin_avg")]:
         df[f"{col}_this"] = df[f"{col}_real"]
         df.loc[mask_normal, f"{col}_this"] = np.nan
         df[f"{col}_this"] = df[f"{col}_this"].astype(float).fillna(df[avg_col]).round(1)
-
     df["prcp_this"] = df["prcp_real"]
     df.loc[mask_normal, "prcp_this"] = 0.0
     df["prcp_this"] = df["prcp_this"].astype(float).fillna(0.0).round(1)
-
     df.drop(columns=["month_day", "date_ts", "tave_avg", "tmax_avg", "tmin_avg", "tave_real", "tmax_real", "tmin_real", "prcp_real"], inplace=True)
     return df
 
@@ -190,22 +174,17 @@ def build_accumulation_dataframe(df_src: pd.DataFrame, start_date: date, end_dat
     if not start_date or not end_date: return pd.DataFrame(), {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
     validate_method_and_thresholds(method, t_base, t_ceiling)
     if df_src.empty: return df_src.copy(), {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
-
     mask = (df_src["date"] >= start_date) & (df_src["date"] <= end_date)
     df = df_src.loc[mask].copy().reset_index(drop=True)
     if df.empty: return df, {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
-
     df = add_daylength_from_csv(df, df_dl_master) if method in [5, 6, 7, 8] else df.assign(DL_hours=np.nan)
     df["daily_ct"] = df.apply(lambda row: calc_daily_gdd(row, method, t_base, t_ceiling), axis=1).round(1)
     df["cum_ct"] = df["daily_ct"].cumsum().round(1)
-
     df["daily_pr"] = df["prcp_this"].round(1)
     df["cum_pr"] = df["daily_pr"].cumsum().round(1)
-    
     forecast_end_date = datetime.utcnow().date() + timedelta(days=26)
     mask_future = df["date"] > forecast_end_date
     df.loc[mask_future, ["daily_pr", "cum_pr"]] = np.nan
-
     try:
         df["abs_diff"] = (df["cum_ct"] - target_gdd).abs().round(1)
         row_close = df.loc[df["abs_diff"].idxmin()]
@@ -215,7 +194,6 @@ def build_accumulation_dataframe(df_src: pd.DataFrame, start_date: date, end_dat
         }
     except Exception:
         closest = {"date": None, "cum_ct": None, "daily_ct": None, "abs_diff": None}
-        
     return df, closest
 
 def make_hist_dict_simple_ct(date_start: date, date_end: date, df_src: pd.DataFrame):
@@ -235,6 +213,12 @@ def dataframe_to_records_with_iso_date(df: pd.DataFrame):
 def get_climate_data():
     try:
         d = request.get_json()
+        
+        # GASの金庫から届いたトークンを環境変数に一時セット
+        incoming_token = d.get("amd_token")
+        if incoming_token:
+            os.environ["AMD_TOKEN_JSON"] = incoming_token
+
         params = parse_request_payload(d)
         today = datetime.utcnow().date()
         fiscal_year_for_avg = today.year if today.month >= 4 else today.year - 1
@@ -267,14 +251,16 @@ def get_climate_data():
         ct1_period_df = df_this.loc[(df_this["date"] >= params["ct1_start"]) & (df_this["date"] <= params["ct1_end"])].reset_index(drop=True) if not df_this.empty else pd.DataFrame()
         ct2_period_df = df_this.loc[(df_this["date"] >= ct2_start_calc) & (df_this["date"] <= ct2_end_calc)].reset_index(drop=True) if not df_this.empty else pd.DataFrame()
 
+        outgoing_token = os.environ.get("AMD_TOKEN_JSON", "")
+
         return jsonify(replace_nan_with_none({
             "average": df_avg.to_dict(orient="records"), "this_year": df_this_json.to_dict(orient="records"), "forecast": df_forecast_json.to_dict(orient="records"),
             "ct1_period": dataframe_to_records_with_iso_date(ct1_period_df), "ct1": dataframe_to_records_with_iso_date(df_ct1), "gdd1_target": closest1,
             "ct2_period": dataframe_to_records_with_iso_date(ct2_period_df), "ct2": dataframe_to_records_with_iso_date(df_ct2), "gdd2_target": closest2,
-            "ct1_until_yesterday": hist_dict1, "ct2_until_yesterday": hist_dict2
+            "ct1_until_yesterday": hist_dict1, "ct2_until_yesterday": hist_dict2,
+            "updated_token": outgoing_token
         }))
     except Exception as e:
-        # ★エラー時は400を返し、シートへの空データ上書きを確実に防ぎます
         return jsonify({"status": "error", "message": str(e), "trace": traceback.format_exc()}), 400
 
 if __name__ == "__main__":
